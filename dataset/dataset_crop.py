@@ -95,7 +95,7 @@ class PromptDataset(Dataset):
         img_id = ann['image_id']
         coco_img = self.coco_ann.loadImgs(img_id)[0]
         img_name = coco_img['file_name']
-        self.ori_imgsize = (coco_img['height'], coco_img['width'])
+        self.ori_imgsize = (coco_img['width'],coco_img['height'])
 
         self.seg_h, self.seg_w = self.input_size,self.input_size #sam分割结果4倍上采样后计算损失
         self.gt_h, self.gt_w = int(self.input_size/4), int(self.input_size/4)#vmap,voff size. sam output feature map 1/4 
