@@ -50,6 +50,12 @@ python tools/test_auto_bbox.py --image data/test.png --x 350 --y 220 --out outpu
 ```
 It saves `bbox_overlay.png`, `info.json`, and `mask.png` when debug mask output is available.
 
+Run the interactive visualization tool:
+```shell
+python tools/visualize_auto_bbox.py --image figs/eg.jpg --out outputs/auto_bbox_visual --debug
+```
+Left click on the image to generate an adaptive bbox. Press `c` to clear, `s` to save `bbox_overlay.png`, `info.json`, and optional `mask.png`, or `q`/`Esc` to quit.
+
 Limitations: this utility only generates a bbox. It is not yet connected to `interactive_prompt.py`, `infer_poly_crop.py`, or SAMPoly prediction.
 
 ### Auto mode
