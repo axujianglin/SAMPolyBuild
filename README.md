@@ -44,6 +44,12 @@ Run the non-GUI smoke test:
 ```shell
 python test_auto_bbox.py --debug
 ```
+Run the image-based debug tool:
+```shell
+python tools/test_auto_bbox.py --image data/test.png --x 350 --y 220 --out outputs/auto_bbox_debug --debug
+```
+It saves `bbox_overlay.png`, `info.json`, and `mask.png` when debug mask output is available.
+
 Limitations: this utility only generates a bbox. It is not yet connected to `interactive_prompt.py`, `infer_poly_crop.py`, or SAMPoly prediction.
 
 ### Auto mode
