@@ -52,3 +52,14 @@
 - README 需要说明使用方式、参数、限制和调试输出。
 - 新增脚本需要说明输入、输出、依赖模型权重和示例命令。
 - 行为变化必须在文档中明确标注，避免影响原有使用方式。
+
+## 七、Runtime Environment
+
+- 当前项目源码位于 Windows。
+- 实际运行环境位于 Linux 远程服务器。
+- Linux 运行环境使用 Conda environment：`sampoly`。
+- Python、PyTorch、CUDA、SAMPoly 相关依赖均安装在 Linux 环境中。
+- Codex 默认不要直接执行 Python 测试。
+- Codex 默认不要假设本机具备项目运行环境。
+- 当需要测试时，Codex 应生成测试命令，等待用户在 Linux 环境执行，再根据用户返回日志分析问题。
+- 所有测试步骤必须同时提供 Linux 执行命令、预期输出和调试建议。
