@@ -29,6 +29,23 @@ python interactive_prompt.py
 ```
 ![gui](figs/interactive_gui.png)
 
+### Adaptive bbox utility
+The adaptive bbox utility generates a SAMPoly-compatible `xyxy` bbox from one click point without changing the existing prompt inference flow. It can be imported independently:
+```python
+from utils.auto_bbox import generate_adaptive_bbox
+
+bbox, info = generate_adaptive_bbox(image, (x, y), debug=False)
+```
+The input `image` is a `numpy.ndarray` in gray, RGB, BGR, or RGBA layout. The function returns `bbox = [x1, y1, x2, y2]` and an `info` dictionary with `success`, `method`, `message`, `click_point`, `roi`, `raw_bbox`, `final_bbox`, `mask_area`, `fallback_used`, and optional `debug_mask` when `debug=True`.
+
+Config values can be passed with a dict or `AutoBBoxConfig`, including `init_window_size`, `min_box_size`, `max_box_size`, `padding`, `floodfill_lo_diff`, `floodfill_up_diff`, `canny_low`, `canny_high`, `morph_kernel_size`, `fallback_box_size`, `min_area_ratio`, `max_area_ratio`, and `max_aspect_ratio`. If adaptive generation fails, the function returns a clipped fixed-size fallback bbox and records the reason in `info["message"]`.
+
+Run the non-GUI smoke test:
+```shell
+python test_auto_bbox.py --debug
+```
+Limitations: this utility only generates a bbox. It is not yet connected to `interactive_prompt.py`, `infer_poly_crop.py`, or SAMPoly prediction.
+
 ### Auto mode
 You can use the trained model auto_whumix.pth from [Baidu Cloud](https://pan.baidu.com/s/1s6aWDZ77t8Bt-aIHiEG9Gw?pwd=6wqn) / [Google Drive](https://drive.google.com/file/d/1VNyUl2CtV19NqxLhnE4LFw32VUvOD0J9/view?usp=drive_link) to predict the building polygons on the images. Change the **args.img_dir** to the image directory that contains the images you want to predict, and the **args.img_suffix** to the corresponding image suffix.
 ```shell
