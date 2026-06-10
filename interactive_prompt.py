@@ -12,6 +12,7 @@ join = os.path.join
 import argparse
 from utils.test_utils import load_args
 from utils.post_process import GetPolygons,transform_polygon_to_original
+from utils.auto_result_bbox import infer_image_id, load_and_select_bbox
 
 # %% Helper functions
 def show_box(box, ax):
@@ -62,6 +63,14 @@ parser.add_argument('--model_type', type=str, default='vit_b')
 parser.add_argument('--image_size', type=int, default=224)
 parser.add_argument('--multi_mask', type=bool, default=True)
 parser.add_argument('--max_distance', type=int, default=10)
+parser.add_argument('--auto_results', type=str, default=None,
+                    help='Path to auto-mode results.json. If set, first click selects an auto bbox.')
+parser.add_argument('--auto_image_id', type=str, default=None,
+                    help='Image id in auto results. Defaults to image file stem.')
+parser.add_argument('--auto_min_score', type=float, default=0.0,
+                    help='Minimum auto bbox score_cls/score for click selection.')
+parser.add_argument('--auto_max_center_distance', type=float, default=None,
+                    help='Reject nearest auto bbox when its center is farther than this distance.')
 
 args = load_args(parser,path='configs/prompt_instance_spacenet.json')
 args.result_pth = f'{args.work_dir}/{args.task_name}/'
@@ -76,21 +85,83 @@ predictor = SamPredictor(sam_model, polygon=True)
 global image, bbox_coords, prompt_coords
 # Load image
 image = cv2.imread(args.imgpth)
+if image is None:
+    raise ValueError(f"Unable to read image: {args.imgpth}")
 image = image[:, :, ::-1]  # BGR to RGB
 bbox_coords = []  # To store bounding box coordinates
+selected_bbox = None
 prompt_coords = []  # To store prompt point coordinates
 prompt_labels = [1]  # To store prompt point labels (1 or 0). First point is bbox center by default
 defined_bbox = False
+auto_bbox_enabled = args.auto_results is not None
+auto_image_id = args.auto_image_id or infer_image_id(args.imgpth)
+
+
+def reset_interaction():
+    global bbox_coords, selected_bbox, prompt_coords, prompt_labels, defined_bbox
+    bbox_coords = []
+    selected_bbox = None
+    prompt_coords = []
+    prompt_labels = [1]
+    defined_bbox = False
+
+
+def assign_prompt_label(label):
+    if not prompt_coords:
+        print("No prompt point is waiting for a label.")
+        return
+    if len(prompt_labels) == len(prompt_coords) + 1:
+        prompt_labels[-1] = label
+    else:
+        prompt_labels.append(label)
+    print(f"Label {label} assigned to prompt point: {prompt_coords[-1]}")
+    print("Press Enter to predict, or click another prompt point.")
+
+
+def select_auto_bbox(click_point):
+    bbox, info = load_and_select_bbox(
+        args.auto_results,
+        click_point,
+        image_id=auto_image_id,
+        min_score=args.auto_min_score,
+        max_center_distance=args.auto_max_center_distance,
+    )
+    bbox = [int(round(v)) for v in bbox]
+    print(
+        "Auto bbox selected: "
+        f"{bbox}, contains_click={info['contains_click']}, "
+        f"score_cls={info['score_cls']:.4f}, score={info['score']:.4f}"
+    )
+    return bbox
+
+
+def normalize_xyxy(bbox):
+    x1, y1, x2, y2 = bbox
+    return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+
+
 def on_click(event):
-    global bbox_coords, prompt_coords, prompt_labels,defined_bbox
+    global bbox_coords, selected_bbox, prompt_coords, prompt_labels, defined_bbox
     if event.xdata is not None and event.ydata is not None:
-        if len(bbox_coords) < 2:
+        click_point = (int(event.xdata), int(event.ydata))
+        if auto_bbox_enabled and not defined_bbox:
+            try:
+                selected_bbox = select_auto_bbox(click_point)
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"Auto bbox selection failed: {exc}")
+                return
+            prompt_coords.append(click_point)
+            prompt_labels.append(1)
+            defined_bbox = True
+            print(f"Positive prompt point added: {click_point}")
+            print("Click more prompt points and press 1/0 to label them, or press Enter to predict.")
+        elif len(bbox_coords) < 2:
             # Collect bounding box points
-            bbox_coords.append((int(event.xdata), int(event.ydata)))
+            bbox_coords.append(click_point)
             print(f"Selected bbox point: {bbox_coords[-1]}")
         else:
             # Collect prompt point
-            prompt_coords.append((int(event.xdata), int(event.ydata)))
+            prompt_coords.append(click_point)
             print(f"Selected prompt point: {prompt_coords[-1]}")
             print("Now press 1 for positive or 0 for negative label for the clicked point.")
         
@@ -99,22 +170,27 @@ def on_click(event):
             defined_bbox = True
 
 def on_key(event):
-    global image, bbox_coords, prompt_coords, prompt_labels,defined_bbox
+    global image, bbox_coords, selected_bbox, prompt_coords, prompt_labels, defined_bbox
     if event.key in ['0', '1'] :
         # Capture label for the latest prompt point
-        label = int(event.key)
-        prompt_labels.append(label)
-        print(f"Label {label} assigned to prompt point: {prompt_coords[-1]}")
-        
-        if len(prompt_coords) == len(prompt_labels):
-            print("Prompt point and label assigned. Press Enter to predict.")
-    if event.key == 'enter' and len(bbox_coords) == 2:
+        assign_prompt_label(int(event.key))
+    if event.key == 'c':
+        reset_interaction()
+        print("Interaction cleared.")
+        return
+    if event.key == 'enter' and (selected_bbox is not None or len(bbox_coords) == 2):
         # Make prediction
         print("Making prediction...")
-        bbox = [bbox_coords[0][0], bbox_coords[0][1], bbox_coords[1][0], bbox_coords[1][1]]
+        if selected_bbox is not None:
+            bbox = selected_bbox
+        else:
+            bbox = normalize_xyxy([bbox_coords[0][0], bbox_coords[0][1], bbox_coords[1][0], bbox_coords[1][1]])
         prompt_point = np.array([prompt_coords[0]]) if prompt_coords else None
         label = np.array([1, 1]) if prompt_coords else np.array([1])
         if len(prompt_coords) > 0:
+            if len(prompt_labels) != len(prompt_coords) + 1:
+                print("Please press 1 or 0 to label the latest prompt point before predicting.")
+                return
             prompt_point = np.array(prompt_coords)
             label = np.array(prompt_labels)
         else:
@@ -153,11 +229,11 @@ def on_key(event):
         plt.axis('off')
         plt.savefig(join(args.result_pth, 'result.jpg'), bbox_inches='tight', pad_inches=0)
         plt.show()
-        bbox_coords = []
-        prompt_coords = []
-        prompt_labels = [1]
-        defined_bbox = False
-        print("Prediction complete. Click on two points (top left and bottom right) to define bounding box.")
+        if auto_bbox_enabled:
+            print("Prediction complete. Add positive/negative prompt points and press Enter again, or press c to clear.")
+        else:
+            reset_interaction()
+            print("Prediction complete. Click on two points (top left and bottom right) to define bounding box.")
 def onmousemove(event):
     # 处理鼠标移动事件，获取鼠标位置
     ix, iy = event.xdata, event.ydata
@@ -182,7 +258,10 @@ hline = Line2D([0, image.shape[1]], [0, 0], color='red', lw=1, linestyle='--')
 vline = Line2D([0, 0], [0, image.shape[0]], color='red', lw=1, linestyle='--')
 ax.add_line(hline)
 ax.add_line(vline)
-print("Click on two points (top left and bottom right) to define bounding box.")     
+if auto_bbox_enabled:
+    print(f"Auto bbox mode enabled. Using image_id={auto_image_id}. Click one building to select a bbox.")
+else:
+    print("Click on two points (top left and bottom right) to define bounding box.")
 cid_move = fig.canvas.mpl_connect('motion_notify_event', onmousemove)
 cid_click = fig.canvas.mpl_connect('button_press_event', on_click)
 cid_key = fig.canvas.mpl_connect('key_press_event', on_key)

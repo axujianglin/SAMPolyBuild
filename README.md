@@ -67,6 +67,48 @@ Show the predicted polygons and masks on the images (change the img_dir, dt_pth 
 ```shell
 python utils/show_pred.py
 ```
+
+### Auto bbox + prompt interaction
+Auto mode can be used as a full-image building bbox provider, while prompt mode performs single-building interactive polygon refinement. This does not use `utils/auto_bbox.py`; it reuses the `infer_auto.py` output.
+
+Step 1: run auto mode on the target image directory and save `results.json`.
+```shell
+python infer_auto.py \
+  --config configs/auto_whumix.py \
+  --ckpt_path checkpoints/auto_whumix.pth \
+  --img_dir data/my_auto_demo/ \
+  --img_suffix .png \
+  --work_dir work_dir \
+  --score_thr 0.1 \
+  --gpu 0
+```
+
+Step 2: start prompt interaction with the auto results. The first click selects the auto bbox that contains the click point, or the nearest bbox when no bbox contains it. The first click is also used as a positive prompt point. Additional prompt points can be clicked and labeled with `1` for positive or `0` for negative. Press `Enter` to predict and `c` to clear the current interaction.
+```shell
+python interactive_prompt.py \
+  --imgpth data/my_auto_demo/3001001.png \
+  --auto_results work_dir/whumix_auto/results.json \
+  --auto_image_id 3001001 \
+  --auto_min_score 0.1 \
+  --gpu 0
+```
+
+If `--auto_image_id` is omitted, the image file stem is used. For example, `3001001.png` maps to image id `3001001`.
+
+Run the non-GUI bbox selection check:
+```shell
+python tools/test_select_auto_bbox.py \
+  --results work_dir/whumix_auto/results.json \
+  --image data/my_auto_demo/3001001.png \
+  --x 520 \
+  --y 320 \
+  --min-score 0.1
+```
+
+Expected output is a JSON object with `selected_bbox_xyxy`, `contains_click`, `score_cls`, and distance fields. If no candidate is found, check that the image id matches `results.json`, lower `--min-score`, or run `infer_auto.py` again for the target image.
+
+Limitations: auto bbox selection depends on an existing `infer_auto.py` result file and checkpoint. It does not run the auto detector inside `interactive_prompt.py`, and it does not modify the auto detection network or training flow.
+
 ## Dataset Preparation
 ### SpaceNet Vegas Dataset
 We converted the original images of the SpaceNet dataset to 8-bit and the annotations to coco format, and divided them into training, validation, and test sets in the ratio of 8:1:1, which are available for download from [here](https://aistudio.baidu.com/datasetdetail/269168). Place the train, val, test folders in the 'dataset/spacenet' folder.
