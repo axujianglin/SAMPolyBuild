@@ -77,6 +77,11 @@ parser.add_argument('--debug_prompt_points', action='store_true',
                     help='Print prompt point coordinates and labels through the interactive prediction chain.')
 parser.add_argument('--refine_by_points', action='store_true',
                     help='Remove connected mask components that contain negative prompt points before polygon extraction.')
+parser.add_argument('--point_refine_mode', choices=['connected_component', 'distance'],
+                    default='connected_component',
+                    help='Point-guided mask refinement mode used when --refine_by_points is set.')
+parser.add_argument('--negative_margin', type=float, default=0.0,
+                    help='Distance margin for distance point refinement. Larger values remove more pixels near negative points.')
 
 args = load_args(parser,path='configs/prompt_instance_spacenet.json')
 args.result_pth = f'{args.work_dir}/{args.task_name}/'
@@ -208,7 +213,44 @@ def save_binary_mask(path, mask):
     cv2.imwrite(path, mask_to_save)
 
 
-def refine_mask_by_points(mask, point_coords, point_labels):
+def save_point_refine_regions(path, original_mask, refined_mask, point_coords, point_labels):
+    before = (original_mask > 0).astype(np.uint8)
+    after = (refined_mask > 0).astype(np.uint8)
+    kept = (before == 1) & (after == 1)
+    removed = (before == 1) & (after == 0)
+    vis = np.zeros((before.shape[0], before.shape[1], 3), dtype=np.uint8)
+    vis[before == 1] = (80, 80, 80)
+    vis[kept] = (0, 180, 0)
+    vis[removed] = (0, 0, 220)
+    if point_coords is not None and point_labels is not None:
+        for point, label in zip(point_coords, point_labels):
+            x = int(round(float(point[0])))
+            y = int(round(float(point[1])))
+            color = (0, 255, 0) if int(label) == 1 else (0, 0, 255)
+            cv2.circle(vis, (x, y), 3, color, thickness=-1)
+            cv2.circle(vis, (x, y), 5, (255, 255, 255), thickness=1)
+    cv2.imwrite(path, vis)
+
+
+def split_prompt_points(point_coords, point_labels, width, height):
+    positive_points = []
+    negative_points = []
+    if point_coords is None or point_labels is None:
+        return positive_points, negative_points
+    for point, label in zip(point_coords, point_labels):
+        x = int(round(float(point[0])))
+        y = int(round(float(point[1])))
+        if not (0 <= x < width and 0 <= y < height):
+            print(f"Warning: prompt point ({x}, {y}) is outside mask bounds ({width}, {height}); skipped.")
+            continue
+        if int(label) == 1:
+            positive_points.append((x, y))
+        elif int(label) == 0:
+            negative_points.append((x, y))
+    return positive_points, negative_points
+
+
+def refine_mask_by_connected_components(mask, point_coords, point_labels):
     if point_coords is None or point_labels is None:
         return mask, False
     if mask.ndim != 3 or mask.shape[0] != 1:
@@ -218,22 +260,18 @@ def refine_mask_by_points(mask, point_coords, point_labels):
     binary_mask = (mask[0] > 0).astype(np.uint8)
     num_components, labels_map = cv2.connectedComponents(binary_mask, connectivity=8)
     all_components = set(range(1, num_components))
+    height, width = binary_mask.shape
+    positive_points, negative_points = split_prompt_points(point_coords, point_labels, width, height)
     positive_components = set()
     negative_components = set()
-    height, width = binary_mask.shape
 
-    for point, label in zip(point_coords, point_labels):
-        x = int(round(float(point[0])))
-        y = int(round(float(point[1])))
-        if not (0 <= x < width and 0 <= y < height):
-            print(f"Warning: prompt point ({x}, {y}) is outside mask bounds ({width}, {height}); skipped.")
-            continue
+    for x, y in positive_points:
         component_id = int(labels_map[y, x])
-        if component_id <= 0:
-            continue
-        if int(label) == 1:
+        if component_id > 0:
             positive_components.add(component_id)
-        elif int(label) == 0:
+    for x, y in negative_points:
+        component_id = int(labels_map[y, x])
+        if component_id > 0:
             negative_components.add(component_id)
 
     if positive_components:
@@ -254,13 +292,62 @@ def refine_mask_by_points(mask, point_coords, point_labels):
     refined_mask = refined_mask_2d.reshape(1, height, width)
     removed_components = sorted(negative_components & all_components)
     print(
-        "Point refinement applied: "
+        "Connected-component point refinement applied: "
         f"positive_components={sorted(positive_components)}, "
         f"negative_components={sorted(negative_components)}, "
         f"removed_components={removed_components}, "
         f"kept_components={sorted(keep_components)}"
     )
     return refined_mask, True
+
+
+def refine_mask_by_distance(mask, point_coords, point_labels, negative_margin):
+    if point_coords is None or point_labels is None:
+        return mask, False
+    if mask.ndim != 3 or mask.shape[0] != 1:
+        raise ValueError(f"Expected mask shape (1, H, W), got {mask.shape}")
+
+    original_mask = mask.copy()
+    binary_mask = (mask[0] > 0).astype(np.uint8)
+    height, width = binary_mask.shape
+    positive_points, negative_points = split_prompt_points(point_coords, point_labels, width, height)
+    if not positive_points or not negative_points:
+        print("Warning: distance point refinement requires at least one positive and one negative point; using original mask.")
+        return original_mask, False
+
+    ys, xs = np.where(binary_mask > 0)
+    if xs.size == 0:
+        print("Warning: distance point refinement received an empty mask; using original mask.")
+        return original_mask, False
+
+    pixels = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+    pos = np.asarray(positive_points, dtype=np.float32)
+    neg = np.asarray(negative_points, dtype=np.float32)
+    dist_to_pos = np.sqrt(((pixels[:, None, :] - pos[None, :, :]) ** 2).sum(axis=2)).min(axis=1)
+    dist_to_neg = np.sqrt(((pixels[:, None, :] - neg[None, :, :]) ** 2).sum(axis=2)).min(axis=1)
+    keep_pixels = dist_to_pos + float(negative_margin) < dist_to_neg
+
+    refined_mask_2d = np.zeros_like(binary_mask, dtype=mask.dtype)
+    refined_mask_2d[ys[keep_pixels], xs[keep_pixels]] = 1
+    if np.count_nonzero(refined_mask_2d) == 0:
+        print("Warning: distance point refinement removed all mask pixels; using original mask.")
+        return original_mask, False
+
+    removed_pixels = int(xs.size - np.count_nonzero(refined_mask_2d))
+    print(
+        "Distance point refinement applied: "
+        f"positive_points={positive_points}, negative_points={negative_points}, "
+        f"negative_margin={negative_margin}, removed_pixels={removed_pixels}, kept_pixels={int(np.count_nonzero(refined_mask_2d))}"
+    )
+    return refined_mask_2d.reshape(1, height, width), True
+
+
+def refine_mask_by_points(mask, point_coords, point_labels):
+    if args.point_refine_mode == 'connected_component':
+        return refine_mask_by_connected_components(mask, point_coords, point_labels)
+    if args.point_refine_mode == 'distance':
+        return refine_mask_by_distance(mask, point_coords, point_labels, args.negative_margin)
+    raise ValueError(f"Unsupported point_refine_mode: {args.point_refine_mode}")
 
 
 def save_interaction_result(instance_key, bbox, prompt_points, labels, polygon, mask):
@@ -426,11 +513,14 @@ def on_key(event):
         if args.refine_by_points:
             before_path = join(args.result_pth, "mask_before_point_refine.png")
             after_path = join(args.result_pth, "mask_after_point_refine.png")
+            regions_path = join(args.result_pth, "mask_point_refine_regions.png")
             save_binary_mask(before_path, mask[0])
+            original_mask_for_refine = mask.copy()
             mask, refined = refine_mask_by_points(mask, point, label)
             save_binary_mask(after_path, mask[0])
+            save_point_refine_regions(regions_path, original_mask_for_refine[0], mask[0], point, label)
             if refined:
-                print(f"Point refinement debug masks saved: {before_path}, {after_path}")
+                print(f"Point refinement debug masks saved: {before_path}, {after_path}, {regions_path}")
 
         # Post-process
         polygon, score, _ = GetPolygons(mask, pred_vmap, pred_voff, ori_size=(crop_w, crop_h),
