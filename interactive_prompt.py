@@ -10,6 +10,7 @@ from PIL import Image
 
 join = os.path.join
 import argparse
+import inspect
 import json
 from utils.test_utils import load_args
 from utils.post_process import GetPolygons,transform_polygon_to_original
@@ -181,6 +182,25 @@ def debug_prompt_state(stage, coords=None, labels=None, extra=None):
         print(f"  {extra}")
 
 
+def predict_with_optional_debug(predictor, point_coords, point_labels, box, multimask_output):
+    kwargs = dict(
+        point_coords=point_coords,
+        point_labels=point_labels,
+        box=box,
+        multimask_output=multimask_output,
+    )
+    if args.debug_prompt_points:
+        signature = inspect.signature(predictor.predict)
+        if "debug_prompt_points" in signature.parameters:
+            kwargs["debug_prompt_points"] = True
+        else:
+            print(
+                "[debug_prompt_points] predictor.predict does not accept debug_prompt_points; "
+                "inner predictor logs are unavailable in this environment."
+            )
+    return predictor.predict(**kwargs)
+
+
 def save_interaction_result(instance_key, bbox, prompt_points, labels, polygon, mask):
     mask_name = f"{instance_key}_latest_mask.png"
     mask_path = join(mask_result_dir, mask_name)
@@ -327,12 +347,12 @@ def on_key(event):
         # Set image and predict
         predictor.set_image_resize(image_crop)
         debug_prompt_state("before predictor.predict", coords=point, labels=label)
-        mask, score, logit, pred_poly = predictor.predict(
+        mask, score, logit, pred_poly = predict_with_optional_debug(
+            predictor=predictor,
             point_coords=point,
             point_labels=label,
             box=new_bbox,
             multimask_output=args.multi_mask,
-            debug_prompt_points=args.debug_prompt_points,
         )
         pred_vmap, pred_voff = pred_poly['vmap'], pred_poly['voff']
         pred_vmap = torch.sigmoid(pred_vmap)
