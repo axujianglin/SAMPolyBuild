@@ -104,6 +104,12 @@ Each selected building uses a stable instance key. Re-predicting the same select
 
 Use `--debug_prompt_points` with `interactive_prompt.py` to print raw click points, crop-transformed prompt points, predictor-transformed points, and labels before prompt encoding and mask prediction.
 
+Use `--refine_by_points` to run point-guided mask post-processing before polygon extraction. It removes connected mask components that contain negative prompt points and keeps components that contain positive prompt points. This does not change the model. The latest debug masks are saved to:
+```text
+work_dir/prompt_instance_spacenet/mask_before_point_refine.png
+work_dir/prompt_instance_spacenet/mask_after_point_refine.png
+```
+
 Run the non-GUI bbox selection check:
 ```shell
 python tools/test_select_auto_bbox.py \

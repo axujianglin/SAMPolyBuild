@@ -75,6 +75,8 @@ parser.add_argument('--auto_max_center_distance', type=float, default=None,
                     help='Reject nearest auto bbox when its center is farther than this distance.')
 parser.add_argument('--debug_prompt_points', action='store_true',
                     help='Print prompt point coordinates and labels through the interactive prediction chain.')
+parser.add_argument('--refine_by_points', action='store_true',
+                    help='Remove connected mask components that contain negative prompt points before polygon extraction.')
 
 args = load_args(parser,path='configs/prompt_instance_spacenet.json')
 args.result_pth = f'{args.work_dir}/{args.task_name}/'
@@ -199,6 +201,66 @@ def predict_with_optional_debug(predictor, point_coords, point_labels, box, mult
                 "inner predictor logs are unavailable in this environment."
             )
     return predictor.predict(**kwargs)
+
+
+def save_binary_mask(path, mask):
+    mask_to_save = ((mask > 0).astype(np.uint8) * 255)
+    cv2.imwrite(path, mask_to_save)
+
+
+def refine_mask_by_points(mask, point_coords, point_labels):
+    if point_coords is None or point_labels is None:
+        return mask, False
+    if mask.ndim != 3 or mask.shape[0] != 1:
+        raise ValueError(f"Expected mask shape (1, H, W), got {mask.shape}")
+
+    original_mask = mask.copy()
+    binary_mask = (mask[0] > 0).astype(np.uint8)
+    num_components, labels_map = cv2.connectedComponents(binary_mask, connectivity=8)
+    all_components = set(range(1, num_components))
+    positive_components = set()
+    negative_components = set()
+    height, width = binary_mask.shape
+
+    for point, label in zip(point_coords, point_labels):
+        x = int(round(float(point[0])))
+        y = int(round(float(point[1])))
+        if not (0 <= x < width and 0 <= y < height):
+            print(f"Warning: prompt point ({x}, {y}) is outside mask bounds ({width}, {height}); skipped.")
+            continue
+        component_id = int(labels_map[y, x])
+        if component_id <= 0:
+            continue
+        if int(label) == 1:
+            positive_components.add(component_id)
+        elif int(label) == 0:
+            negative_components.add(component_id)
+
+    if positive_components:
+        keep_components = positive_components
+    else:
+        keep_components = all_components - negative_components
+    keep_components = keep_components - negative_components
+
+    if not keep_components:
+        print("Warning: point refinement removed all mask components; using original mask.")
+        return original_mask, False
+
+    refined_mask_2d = np.isin(labels_map, list(keep_components)).astype(mask.dtype)
+    if np.count_nonzero(refined_mask_2d) == 0:
+        print("Warning: point refinement produced an empty mask; using original mask.")
+        return original_mask, False
+
+    refined_mask = refined_mask_2d.reshape(1, height, width)
+    removed_components = sorted(negative_components & all_components)
+    print(
+        "Point refinement applied: "
+        f"positive_components={sorted(positive_components)}, "
+        f"negative_components={sorted(negative_components)}, "
+        f"removed_components={removed_components}, "
+        f"kept_components={sorted(keep_components)}"
+    )
+    return refined_mask, True
 
 
 def save_interaction_result(instance_key, bbox, prompt_points, labels, polygon, mask):
@@ -360,6 +422,15 @@ def on_key(event):
         crop_w, crop_h = bbox_crop[2] - bbox_crop[0], bbox_crop[3] - bbox_crop[1]
         if args.multi_mask:
             mask = mask[np.argmax(score), :, :].reshape(1, crop_h, crop_w)
+
+        if args.refine_by_points:
+            before_path = join(args.result_pth, "mask_before_point_refine.png")
+            after_path = join(args.result_pth, "mask_after_point_refine.png")
+            save_binary_mask(before_path, mask[0])
+            mask, refined = refine_mask_by_points(mask, point, label)
+            save_binary_mask(after_path, mask[0])
+            if refined:
+                print(f"Point refinement debug masks saved: {before_path}, {after_path}")
 
         # Post-process
         polygon, score, _ = GetPolygons(mask, pred_vmap, pred_voff, ori_size=(crop_w, crop_h),
