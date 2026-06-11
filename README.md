@@ -95,6 +95,13 @@ python interactive_prompt.py \
 
 If `--auto_image_id` is omitted, the image file stem is used. For example, `3001001.png` maps to image id `3001001`.
 
+Prompt interaction saves the latest per-building result to:
+```text
+work_dir/prompt_instance_spacenet/interactive_results.json
+work_dir/prompt_instance_spacenet/interactive_masks/
+```
+Each selected building uses a stable instance key. Re-predicting the same selected bbox overwrites that instance's `latest_polygon`, `click_points`, `latest_mask_path`, and `version`. Results for other selected buildings are kept. The display removes the previous polygon for the same building before drawing the latest one.
+
 Run the non-GUI bbox selection check:
 ```shell
 python tools/test_select_auto_bbox.py \

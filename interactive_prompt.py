@@ -10,6 +10,7 @@ from PIL import Image
 
 join = os.path.join
 import argparse
+import json
 from utils.test_utils import load_args
 from utils.post_process import GetPolygons,transform_polygon_to_original
 from utils.auto_result_bbox import infer_image_id, load_and_select_bbox
@@ -76,6 +77,9 @@ args = load_args(parser,path='configs/prompt_instance_spacenet.json')
 args.result_pth = f'{args.work_dir}/{args.task_name}/'
 args.checkpoint = 'prompt_interactive.pth'
 os.makedirs(args.result_pth, exist_ok=True)
+mask_result_dir = join(args.result_pth, "interactive_masks")
+os.makedirs(mask_result_dir, exist_ok=True)
+interactive_result_path = join(args.result_pth, "interactive_results.json")
 
 # %% Load the model
 device = 'cuda:' + str(args.gpu)
@@ -90,6 +94,10 @@ if image is None:
 image = image[:, :, ::-1]  # BGR to RGB
 bbox_coords = []  # To store bounding box coordinates
 selected_bbox = None
+selected_auto_info = None
+current_instance_key = None
+interaction_results = {}
+instance_artists = {}
 prompt_coords = []  # To store prompt point coordinates
 prompt_labels = [1]  # To store prompt point labels (1 or 0). First point is bbox center by default
 defined_bbox = False
@@ -98,9 +106,11 @@ auto_image_id = args.auto_image_id or infer_image_id(args.imgpth)
 
 
 def reset_interaction():
-    global bbox_coords, selected_bbox, prompt_coords, prompt_labels, defined_bbox
+    global bbox_coords, selected_bbox, selected_auto_info, current_instance_key, prompt_coords, prompt_labels, defined_bbox
     bbox_coords = []
     selected_bbox = None
+    selected_auto_info = None
+    current_instance_key = None
     prompt_coords = []
     prompt_labels = [1]
     defined_bbox = False
@@ -132,7 +142,7 @@ def select_auto_bbox(click_point):
         f"{bbox}, contains_click={info['contains_click']}, "
         f"score_cls={info['score_cls']:.4f}, score={info['score']:.4f}"
     )
-    return bbox
+    return bbox, info
 
 
 def normalize_xyxy(bbox):
@@ -140,16 +150,95 @@ def normalize_xyxy(bbox):
     return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
 
 
+def make_instance_key(bbox, auto_info=None):
+    image_id = auto_image_id or infer_image_id(args.imgpth) or "image"
+    if auto_info is not None and auto_info.get("index") is not None:
+        return f"{image_id}_auto_{int(auto_info['index']):04d}"
+    bbox_part = "_".join(str(int(round(v))) for v in bbox)
+    return f"{image_id}_bbox_{bbox_part}"
+
+
+def prompt_points_to_json(points, labels):
+    if points is None:
+        return []
+    items = []
+    for point, label in zip(points, labels[1:]):
+        items.append({"x": int(point[0]), "y": int(point[1]), "label": int(label)})
+    return items
+
+
+def save_interaction_result(instance_key, bbox, prompt_points, labels, polygon, mask):
+    mask_name = f"{instance_key}_latest_mask.png"
+    mask_path = join(mask_result_dir, mask_name)
+    mask_to_save = ((mask[0] > 0).astype(np.uint8) * 255)
+    cv2.imwrite(mask_path, mask_to_save)
+
+    previous = interaction_results.get(instance_key, {})
+    version = int(previous.get("version", 0)) + 1
+    interaction_results[instance_key] = {
+        "selected_bbox": [int(v) for v in bbox],
+        "click_points": prompt_points_to_json(prompt_points, labels),
+        "latest_polygon": [[float(x), float(y)] for x, y in polygon.tolist()],
+        "latest_mask_path": f"interactive_masks/{mask_name}",
+        "version": version,
+    }
+    payload = {
+        "image_name": os.path.basename(args.imgpth),
+        "instances": interaction_results,
+    }
+    with open(interactive_result_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Interactive result saved to {interactive_result_path} (instance={instance_key}, version={version})")
+
+
+def clear_instance_artists(instance_key):
+    for artist in instance_artists.get(instance_key, []):
+        try:
+            artist.remove()
+        except ValueError:
+            pass
+    instance_artists[instance_key] = []
+
+
+def draw_latest_prediction(instance_key, bbox, prompt_point, labels, polygon):
+    clear_instance_artists(instance_key)
+    artists = []
+    if prompt_point is not None:
+        pos_points = prompt_point[labels[1:] == 1]
+        neg_points = prompt_point[labels[1:] == 0]
+        if pos_points.shape[0] > 0:
+            artists.append(
+                ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*',
+                           s=300, edgecolor='white', linewidth=1.25)
+            )
+        if neg_points.shape[0] > 0:
+            artists.append(
+                ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*',
+                           s=300, edgecolor='white', linewidth=1.25)
+            )
+    x0, y0 = bbox[0], bbox[1]
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    artists.append(
+        ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='yellow', facecolor=(0, 0, 0, 0), lw=1))
+    )
+    line, = ax.plot(polygon[:, 0], polygon[:, 1], color='r', linewidth=1)
+    artists.append(line)
+    artists.append(ax.scatter(polygon[:, 0], polygon[:, 1], color='b', linewidths=1, marker='.'))
+    instance_artists[instance_key] = artists
+    fig.canvas.draw_idle()
+
+
 def on_click(event):
-    global bbox_coords, selected_bbox, prompt_coords, prompt_labels, defined_bbox
+    global bbox_coords, selected_bbox, selected_auto_info, current_instance_key, prompt_coords, prompt_labels, defined_bbox
     if event.xdata is not None and event.ydata is not None:
         click_point = (int(event.xdata), int(event.ydata))
         if auto_bbox_enabled and not defined_bbox:
             try:
-                selected_bbox = select_auto_bbox(click_point)
+                selected_bbox, selected_auto_info = select_auto_bbox(click_point)
             except (FileNotFoundError, ValueError) as exc:
                 print(f"Auto bbox selection failed: {exc}")
                 return
+            current_instance_key = make_instance_key(selected_bbox, selected_auto_info)
             prompt_coords.append(click_point)
             prompt_labels.append(1)
             defined_bbox = True
@@ -174,7 +263,7 @@ def on_click(event):
             defined_bbox = True
 
 def on_key(event):
-    global image, bbox_coords, selected_bbox, prompt_coords, prompt_labels, defined_bbox
+    global image, bbox_coords, selected_bbox, selected_auto_info, current_instance_key, prompt_coords, prompt_labels, defined_bbox
     if event.key in ['0', '1'] :
         # Capture label for the latest prompt point
         assign_prompt_label(int(event.key))
@@ -189,6 +278,8 @@ def on_key(event):
             bbox = selected_bbox
         else:
             bbox = normalize_xyxy([bbox_coords[0][0], bbox_coords[0][1], bbox_coords[1][0], bbox_coords[1][1]])
+            if current_instance_key is None:
+                current_instance_key = make_instance_key(bbox)
         prompt_point = np.array([prompt_coords[0]]) if prompt_coords else None
         label = np.array([1, 1]) if prompt_coords else np.array([1])
         if len(prompt_coords) > 0:
@@ -223,13 +314,10 @@ def on_key(event):
                         max_distance=args.max_distance)
         polygon = polygon[0]
         polygon=transform_polygon_to_original(polygon, pos_transform)
+        save_interaction_result(current_instance_key, bbox, prompt_point, label, polygon, mask)
 
         # Visualization
-        if prompt_point is not None:
-            show_points(prompt_point, label[1:], plt.gca(), marker_size=300)#label[0]为中心点
-        show_box(bbox, plt.gca())
-        plt.plot(polygon[:, 0], polygon[:, 1], color='r', linewidth=1)
-        plt.scatter(polygon[:, 0], polygon[:, 1], color='b', linewidths=1, marker='.')
+        draw_latest_prediction(current_instance_key, bbox, prompt_point, label, polygon)
         plt.axis('off')
         plt.savefig(join(args.result_pth, 'result.jpg'), bbox_inches='tight', pad_inches=0)
         plt.show()
