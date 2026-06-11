@@ -72,6 +72,8 @@ parser.add_argument('--auto_min_score', type=float, default=0.0,
                     help='Minimum auto bbox score_cls/score for click selection.')
 parser.add_argument('--auto_max_center_distance', type=float, default=None,
                     help='Reject nearest auto bbox when its center is farther than this distance.')
+parser.add_argument('--debug_prompt_points', action='store_true',
+                    help='Print prompt point coordinates and labels through the interactive prediction chain.')
 
 args = load_args(parser,path='configs/prompt_instance_spacenet.json')
 args.result_pth = f'{args.work_dir}/{args.task_name}/'
@@ -165,6 +167,18 @@ def prompt_points_to_json(points, labels):
     for point, label in zip(points, labels[1:]):
         items.append({"x": int(point[0]), "y": int(point[1]), "label": int(label)})
     return items
+
+
+def debug_prompt_state(stage, coords=None, labels=None, extra=None):
+    if not args.debug_prompt_points:
+        return
+    print(f"[debug_prompt_points] {stage}")
+    if coords is not None:
+        print(f"  point_coords = {np.asarray(coords).tolist()}")
+    if labels is not None:
+        print(f"  point_labels = {np.asarray(labels).tolist()}")
+    if extra is not None:
+        print(f"  {extra}")
 
 
 def save_interaction_result(instance_key, bbox, prompt_points, labels, polygon, mask):
@@ -291,16 +305,34 @@ def on_key(event):
         else:
             prompt_point = None
             label = np.array([1])  # Default to positive if no prompt points
+        raw_click_points = [
+            (int(point[0]), int(point[1]), int(point_label))
+            for point, point_label in zip(prompt_coords, label[1:])
+        ]
+        debug_prompt_state(
+            "raw click points",
+            coords=[point[:2] for point in raw_click_points],
+            labels=[point[2] for point in raw_click_points],
+            extra=f"raw_click_points = {raw_click_points}"
+        )
         bbox_crop, point, new_bbox,pos_transform = get_prompt(bbox, imgsize=image.shape[1], prompt_point=prompt_point)
+        debug_prompt_state(
+            "after crop transform",
+            coords=point,
+            labels=label,
+            extra=f"bbox_crop={bbox_crop}, new_bbox={new_bbox.tolist()}, pos_transform={pos_transform}"
+        )
         image_crop = image[bbox_crop[1]:bbox_crop[3], bbox_crop[0]:bbox_crop[2], :]
 
         # Set image and predict
         predictor.set_image_resize(image_crop)
+        debug_prompt_state("before predictor.predict", coords=point, labels=label)
         mask, score, logit, pred_poly = predictor.predict(
             point_coords=point,
             point_labels=label,
             box=new_bbox,
             multimask_output=args.multi_mask,
+            debug_prompt_points=args.debug_prompt_points,
         )
         pred_vmap, pred_voff = pred_poly['vmap'], pred_poly['voff']
         pred_vmap = torch.sigmoid(pred_vmap)

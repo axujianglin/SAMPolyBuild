@@ -102,6 +102,8 @@ work_dir/prompt_instance_spacenet/interactive_masks/
 ```
 Each selected building uses a stable instance key. Re-predicting the same selected bbox overwrites that instance's `latest_polygon`, `click_points`, `latest_mask_path`, and `version`. Results for other selected buildings are kept. The display removes the previous polygon for the same building before drawing the latest one.
 
+Use `--debug_prompt_points` with `interactive_prompt.py` to print raw click points, crop-transformed prompt points, predictor-transformed points, and labels before prompt encoding and mask prediction.
+
 Run the non-GUI bbox selection check:
 ```shell
 python tools/test_select_auto_bbox.py \
