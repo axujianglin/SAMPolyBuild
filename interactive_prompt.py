@@ -155,6 +155,10 @@ def on_click(event):
             defined_bbox = True
             print(f"Positive prompt point added: {click_point}")
             print("Click more prompt points and press 1/0 to label them, or press Enter to predict.")
+        elif auto_bbox_enabled and defined_bbox:
+            prompt_coords.append(click_point)
+            print(f"Selected prompt point: {prompt_coords[-1]}")
+            print("Now press 1 for positive or 0 for negative label for the clicked point.")
         elif len(bbox_coords) < 2:
             # Collect bounding box points
             bbox_coords.append(click_point)
