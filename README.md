@@ -111,6 +111,38 @@ work_dir/prompt_instance_spacenet/mask_after_point_refine.png
 work_dir/prompt_instance_spacenet/mask_point_refine_regions.png
 ```
 
+Use `--negative_feature_refine` to run negative-feature mask post-processing before polygon extraction. This does not change the model and is disabled by default. Each negative prompt point builds an RGB/HSV/LAB patch prototype, searches visually similar pixels inside the current predicted mask, protects positive prompt neighborhoods, and then extracts the polygon from the refined mask. Lower `--negative_similarity_thr` removes more pixels; higher values are more conservative. Larger `--negative_spatial_sigma` lets the negative feature affect a wider area, and `--negative_spatial_sigma 0` disables spatial weighting. The latest debug outputs are saved to:
+```text
+work_dir/prompt_instance_spacenet/negative_patch.png
+work_dir/prompt_instance_spacenet/negative_similarity_map.png
+work_dir/prompt_instance_spacenet/mask_before_refine.png
+work_dir/prompt_instance_spacenet/mask_after_refine.png
+work_dir/prompt_instance_spacenet/polygon_before_refine.png
+work_dir/prompt_instance_spacenet/polygon_after_refine.png
+```
+Recommended first-pass parameters:
+```shell
+python interactive_prompt.py \
+  --imgpth data/my_auto_demo/3001001.png \
+  --auto_results work_dir/whumix_auto/results.json \
+  --auto_image_id 3001001 \
+  --auto_min_score 0.1 \
+  --negative_feature_refine \
+  --negative_similarity_thr 0.75 \
+  --negative_feature_patch_size 21 \
+  --negative_protect_radius 20 \
+  --negative_spatial_sigma 80 \
+  --gpu 0
+```
+Limitations: this first version uses hand-crafted color statistics rather than deep image features. It works best for tree, shadow, grass, or adjacent-roof regions with visual contrast. If roof pixels are removed, raise `--negative_similarity_thr`, reduce `--negative_spatial_sigma`, or increase `--negative_protect_radius`.
+
+Run the non-GUI negative feature refinement check:
+```shell
+python tools/test_negative_feature_refine.py \
+  --out_dir work_dir/negative_feature_refine_debug
+```
+Expected output includes `Negative feature refinement applied`, fewer `after_pixels` than `before_pixels`, `protected_positive_kept=True`, and `negative_region_removed=True`.
+
 Run the non-GUI bbox selection check:
 ```shell
 python tools/test_select_auto_bbox.py \

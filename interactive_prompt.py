@@ -15,6 +15,7 @@ import json
 from utils.test_utils import load_args
 from utils.post_process import GetPolygons,transform_polygon_to_original
 from utils.auto_result_bbox import infer_image_id, load_and_select_bbox
+from utils.negative_feature_refine import refine_mask_by_negative_features, save_negative_feature_debug
 
 # %% Helper functions
 def show_box(box, ax):
@@ -82,6 +83,16 @@ parser.add_argument('--point_refine_mode', choices=['connected_component', 'dist
                     help='Point-guided mask refinement mode used when --refine_by_points is set.')
 parser.add_argument('--negative_margin', type=float, default=0.0,
                     help='Distance margin for distance point refinement. Larger values remove more pixels near negative points.')
+parser.add_argument('--negative_feature_refine', action='store_true',
+                    help='Use negative-point feature prototypes to remove visually similar mask pixels before polygon extraction.')
+parser.add_argument('--negative_similarity_thr', type=float, default=0.75,
+                    help='Similarity threshold for negative feature refinement.')
+parser.add_argument('--negative_feature_patch_size', type=int, default=21,
+                    help='Patch size around each negative point for feature prototype extraction.')
+parser.add_argument('--negative_protect_radius', type=int, default=20,
+                    help='Radius around positive points that negative feature refinement cannot remove.')
+parser.add_argument('--negative_spatial_sigma', type=float, default=80.0,
+                    help='Spatial falloff sigma for negative feature refinement. Use <=0 to disable spatial weighting.')
 
 args = load_args(parser,path='configs/prompt_instance_spacenet.json')
 args.result_pth = f'{args.work_dir}/{args.task_name}/'
@@ -350,6 +361,31 @@ def refine_mask_by_points(mask, point_coords, point_labels):
     raise ValueError(f"Unsupported point_refine_mode: {args.point_refine_mode}")
 
 
+def polygon_from_mask(mask, pred_vmap, pred_voff, crop_w, crop_h):
+    polygons, scores, valid_mask = GetPolygons(
+        mask,
+        pred_vmap,
+        pred_voff,
+        ori_size=(crop_w, crop_h),
+        max_distance=args.max_distance,
+    )
+    return polygons[0], scores[0], valid_mask[0]
+
+
+def split_labeled_points(point_coords, point_labels):
+    if point_coords is None or point_labels is None:
+        return [], []
+    positive_points = []
+    negative_points = []
+    for point, label_value in zip(point_coords, point_labels):
+        item = (int(round(float(point[0]))), int(round(float(point[1]))))
+        if int(label_value) == 1:
+            positive_points.append(item)
+        elif int(label_value) == 0:
+            negative_points.append(item)
+    return positive_points, negative_points
+
+
 def save_interaction_result(instance_key, bbox, prompt_points, labels, polygon, mask):
     mask_name = f"{instance_key}_latest_mask.png"
     mask_path = join(mask_result_dir, mask_name)
@@ -522,11 +558,39 @@ def on_key(event):
             if refined:
                 print(f"Point refinement debug masks saved: {before_path}, {after_path}, {regions_path}")
 
-        # Post-process
-        polygon, score, _ = GetPolygons(mask, pred_vmap, pred_voff, ori_size=(crop_w, crop_h),
-                        max_distance=args.max_distance)
-        polygon = polygon[0]
-        polygon=transform_polygon_to_original(polygon, pos_transform)
+        polygon_before_feature_refine = None
+        if args.negative_feature_refine:
+            before_feature_mask = mask[0].copy()
+            polygon_before_feature_refine, _, _ = polygon_from_mask(mask, pred_vmap, pred_voff, crop_w, crop_h)
+            positive_points, negative_points = split_labeled_points(point, label)
+            feature_refine = refine_mask_by_negative_features(
+                image_crop,
+                before_feature_mask,
+                positive_points,
+                negative_points,
+                patch_size=args.negative_feature_patch_size,
+                similarity_thr=args.negative_similarity_thr,
+                protect_radius=args.negative_protect_radius,
+                spatial_sigma=args.negative_spatial_sigma,
+            )
+            mask = feature_refine["mask"].reshape(1, crop_h, crop_w)
+            print(feature_refine["message"])
+
+        # Post-process from the final mask, after all enabled refinements.
+        polygon_crop, score, _ = polygon_from_mask(mask, pred_vmap, pred_voff, crop_w, crop_h)
+        if args.negative_feature_refine:
+            save_negative_feature_debug(
+                args.result_pth,
+                before_feature_mask,
+                mask[0],
+                feature_refine["similarity_map"],
+                feature_refine["prototypes"],
+                polygon_before=polygon_before_feature_refine,
+                polygon_after=polygon_crop,
+            )
+            print(f"Negative feature refinement debug images saved to {args.result_pth}")
+
+        polygon = transform_polygon_to_original(polygon_crop, pos_transform)
         save_interaction_result(current_instance_key, bbox, prompt_point, label, polygon, mask)
 
         # Visualization
