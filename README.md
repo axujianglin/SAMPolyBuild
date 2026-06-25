@@ -157,6 +157,55 @@ Expected output is a JSON object with `selected_bbox_xyxy`, `contains_click`, `s
 
 Limitations: auto bbox selection depends on an existing `infer_auto.py` result file and checkpoint. It does not run the auto detector inside `interactive_prompt.py`, and it does not modify the auto detection network or training flow.
 
+### Headless single-click prompt inference
+
+`tools/infer_single_click.py` provides a non-GUI prompt inference entry point for external applications. It does not import Matplotlib, wait for mouse or keyboard events, or change the behavior of `interactive_prompt.py`. The command-line click and the selected bbox are passed to the existing `SamPredictor`, and the decoded polygon is converted back to original-image pixel coordinates.
+
+Fixed bbox example:
+```shell
+python tools/infer_single_click.py \
+  --imgpth data/my_auto_demo/3001001.png \
+  --click_x 500 \
+  --click_y 400 \
+  --work_dir work_dir \
+  --output_json work_dir/single_click_result.json \
+  --checkpoint prompt_interactive.pth \
+  --config configs/prompt_instance_spacenet.json \
+  --bbox_mode fixed \
+  --bbox_size 256 \
+  --gpu 0
+```
+
+Auto bbox example:
+```shell
+python tools/infer_single_click.py \
+  --imgpth data/my_auto_demo/3001001.png \
+  --click_x 500 \
+  --click_y 400 \
+  --work_dir work_dir \
+  --output_json work_dir/single_click_result_auto.json \
+  --checkpoint prompt_interactive.pth \
+  --config configs/prompt_instance_spacenet.json \
+  --bbox_mode auto \
+  --bbox_size 256 \
+  --auto_results work_dir/whumix_auto/results.json \
+  --auto_image_id 3001001 \
+  --auto_min_score 0.1 \
+  --gpu 0
+```
+
+`--bbox_mode fixed` creates a boundary-clipped square centered on the click. `--bbox_mode auto` selects an auto detection only when it contains the click; missing results, invalid results, or a nearest bbox that does not contain the click fall back to the fixed bbox. The default prompt checkpoint is `prompt_interactive.pth`, the default config is `configs/prompt_instance_spacenet.json`, and `--gpu -1` selects CPU inference.
+
+Successful output contains `success`, `image_path`, `click`, `bbox`, `bbox_source`, and one instance with `score` and `latest_polygon`. Failures return a nonzero exit code and attempt to write the same JSON envelope with `success: false`, an empty `instances` list, and the error message.
+
+Run the non-GUI utility tests before model inference:
+```shell
+python tools/test_single_click_headless.py
+python tools/infer_single_click.py --help
+```
+
+Limitations: the checkpoint must use the Lightning-style prompt checkpoint format expected by `build_sam(load_pl=True)`. Auto mode reads an existing auto `results.json`; it does not run the auto detector. The prompt input preserves the existing interactive behavior by using the bbox center and command-line click as positive points.
+
 ## Dataset Preparation
 ### SpaceNet Vegas Dataset
 We converted the original images of the SpaceNet dataset to 8-bit and the annotations to coco format, and divided them into training, validation, and test sets in the ratio of 8:1:1, which are available for download from [here](https://aistudio.baidu.com/datasetdetail/269168). Place the train, val, test folders in the 'dataset/spacenet' folder.
