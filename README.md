@@ -29,6 +29,35 @@ python interactive_prompt.py
 ```
 ![gui](figs/interactive_gui.png)
 
+### Adaptive bbox utility
+The adaptive bbox utility generates a SAMPoly-compatible `xyxy` bbox from one click point without changing the existing prompt inference flow. It can be imported independently:
+```python
+from utils.auto_bbox import generate_adaptive_bbox
+
+bbox, info = generate_adaptive_bbox(image, (x, y), debug=False)
+```
+The input `image` is a `numpy.ndarray` in gray, RGB, BGR, or RGBA layout. The function returns `bbox = [x1, y1, x2, y2]` and an `info` dictionary with `success`, `method`, `message`, `click_point`, `roi`, `raw_bbox`, `final_bbox`, `mask_area`, `fallback_used`, and optional `debug_mask` when `debug=True`.
+
+Config values can be passed with a dict or `AutoBBoxConfig`, including `init_window_size`, `min_box_size`, `max_box_size`, `padding`, `floodfill_lo_diff`, `floodfill_up_diff`, `canny_low`, `canny_high`, `morph_kernel_size`, `fallback_box_size`, `min_area_ratio`, `max_area_ratio`, and `max_aspect_ratio`. If adaptive generation fails, the function returns a clipped fixed-size fallback bbox and records the reason in `info["message"]`.
+
+Run the non-GUI smoke test:
+```shell
+python test_auto_bbox.py --debug
+```
+Run the image-based debug tool:
+```shell
+python tools/test_auto_bbox.py --image data/test.png --x 350 --y 220 --out outputs/auto_bbox_debug --debug
+```
+It saves `bbox_overlay.png`, `info.json`, and `mask.png` when debug mask output is available.
+
+Run the interactive visualization tool:
+```shell
+python tools/visualize_auto_bbox.py --image figs/eg.jpg --out outputs/auto_bbox_visual --debug
+```
+Left click on the image to generate an adaptive bbox. Press `c` to clear, `s` to save `bbox_overlay.png`, `info.json`, and optional `mask.png`, or `q`/`Esc` to quit.
+
+Limitations: this utility only generates a bbox. It is not yet connected to `interactive_prompt.py`, `infer_poly_crop.py`, or SAMPoly prediction.
+
 ### Auto mode
 You can use the trained model auto_whumix.pth from [Baidu Cloud](https://pan.baidu.com/s/1s6aWDZ77t8Bt-aIHiEG9Gw?pwd=6wqn) / [Google Drive](https://drive.google.com/file/d/1VNyUl2CtV19NqxLhnE4LFw32VUvOD0J9/view?usp=drive_link) to predict the building polygons on the images. Change the **args.img_dir** to the image directory that contains the images you want to predict, and the **args.img_suffix** to the corresponding image suffix.
 ```shell
@@ -38,6 +67,96 @@ Show the predicted polygons and masks on the images (change the img_dir, dt_pth 
 ```shell
 python utils/show_pred.py
 ```
+
+### Auto bbox + prompt interaction
+Auto mode can be used as a full-image building bbox provider, while prompt mode performs single-building interactive polygon refinement. This does not use `utils/auto_bbox.py`; it reuses the `infer_auto.py` output.
+
+Step 1: run auto mode on the target image directory and save `results.json`.
+```shell
+python infer_auto.py \
+  --config configs/auto_whumix.py \
+  --ckpt_path checkpoints/auto_whumix.pth \
+  --img_dir data/my_auto_demo/ \
+  --img_suffix .png \
+  --work_dir work_dir \
+  --score_thr 0.1 \
+  --gpu 0
+```
+
+Step 2: start prompt interaction with the auto results. The first click selects the auto bbox that contains the click point, or the nearest bbox when no bbox contains it. The first click is also used as a positive prompt point. Additional prompt points can be clicked and labeled with `1` for positive or `0` for negative. Press `Enter` to predict and `c` to clear the current interaction.
+```shell
+python interactive_prompt.py \
+  --imgpth data/my_auto_demo/3001001.png \
+  --auto_results work_dir/whumix_auto/results.json \
+  --auto_image_id 3001001 \
+  --auto_min_score 0.1 \
+  --gpu 0
+```
+
+If `--auto_image_id` is omitted, the image file stem is used. For example, `3001001.png` maps to image id `3001001`.
+
+Prompt interaction saves the latest per-building result to:
+```text
+work_dir/prompt_instance_spacenet/interactive_results.json
+work_dir/prompt_instance_spacenet/interactive_masks/
+```
+Each selected building uses a stable instance key. Re-predicting the same selected bbox overwrites that instance's `latest_polygon`, `click_points`, `latest_mask_path`, and `version`. Results for other selected buildings are kept. The display removes the previous polygon for the same building before drawing the latest one.
+
+Use `--debug_prompt_points` with `interactive_prompt.py` to print raw click points, crop-transformed prompt points, predictor-transformed points, and labels before prompt encoding and mask prediction.
+
+Use `--refine_by_points` to run point-guided mask post-processing before polygon extraction. This does not change the model. The default `--point_refine_mode connected_component` removes connected mask components that contain negative prompt points and keeps components that contain positive prompt points. Use `--point_refine_mode distance` when the target building and negative building are stuck in one connected component; pixels closer to negative points are removed, and `--negative_margin` can be increased to remove more area near negative points. The latest debug masks are saved to:
+```text
+work_dir/prompt_instance_spacenet/mask_before_point_refine.png
+work_dir/prompt_instance_spacenet/mask_after_point_refine.png
+work_dir/prompt_instance_spacenet/mask_point_refine_regions.png
+```
+
+Use `--negative_feature_refine` to run negative-feature mask post-processing before polygon extraction. This does not change the model and is disabled by default. Each negative prompt point builds an RGB/HSV/LAB patch prototype, searches visually similar pixels inside the current predicted mask, protects positive prompt neighborhoods, and then extracts the polygon from the refined mask. Lower `--negative_similarity_thr` removes more pixels; higher values are more conservative. Larger `--negative_spatial_sigma` lets the negative feature affect a wider area, and `--negative_spatial_sigma 0` disables spatial weighting. The latest debug outputs are saved to:
+```text
+work_dir/prompt_instance_spacenet/negative_patch.png
+work_dir/prompt_instance_spacenet/negative_similarity_map.png
+work_dir/prompt_instance_spacenet/mask_before_refine.png
+work_dir/prompt_instance_spacenet/mask_after_refine.png
+work_dir/prompt_instance_spacenet/polygon_before_refine.png
+work_dir/prompt_instance_spacenet/polygon_after_refine.png
+```
+Recommended first-pass parameters:
+```shell
+python interactive_prompt.py \
+  --imgpth data/my_auto_demo/3001001.png \
+  --auto_results work_dir/whumix_auto/results.json \
+  --auto_image_id 3001001 \
+  --auto_min_score 0.1 \
+  --negative_feature_refine \
+  --negative_similarity_thr 0.75 \
+  --negative_feature_patch_size 21 \
+  --negative_protect_radius 20 \
+  --negative_spatial_sigma 80 \
+  --gpu 0
+```
+Limitations: this first version uses hand-crafted color statistics rather than deep image features. It works best for tree, shadow, grass, or adjacent-roof regions with visual contrast. If roof pixels are removed, raise `--negative_similarity_thr`, reduce `--negative_spatial_sigma`, or increase `--negative_protect_radius`.
+
+Run the non-GUI negative feature refinement check:
+```shell
+python tools/test_negative_feature_refine.py \
+  --out_dir work_dir/negative_feature_refine_debug
+```
+Expected output includes `Negative feature refinement applied`, fewer `after_pixels` than `before_pixels`, `protected_positive_kept=True`, and `negative_region_removed=True`.
+
+Run the non-GUI bbox selection check:
+```shell
+python tools/test_select_auto_bbox.py \
+  --results work_dir/whumix_auto/results.json \
+  --image data/my_auto_demo/3001001.png \
+  --x 520 \
+  --y 320 \
+  --min-score 0.1
+```
+
+Expected output is a JSON object with `selected_bbox_xyxy`, `contains_click`, `score_cls`, and distance fields. If no candidate is found, check that the image id matches `results.json`, lower `--min-score`, or run `infer_auto.py` again for the target image.
+
+Limitations: auto bbox selection depends on an existing `infer_auto.py` result file and checkpoint. It does not run the auto detector inside `interactive_prompt.py`, and it does not modify the auto detection network or training flow.
+
 ## Dataset Preparation
 ### SpaceNet Vegas Dataset
 We converted the original images of the SpaceNet dataset to 8-bit and the annotations to coco format, and divided them into training, validation, and test sets in the ratio of 8:1:1, which are available for download from [here](https://aistudio.baidu.com/datasetdetail/269168). Place the train, val, test folders in the 'dataset/spacenet' folder.
