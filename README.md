@@ -206,6 +206,72 @@ python tools/infer_single_click.py --help
 
 Limitations: the checkpoint must use the Lightning-style prompt checkpoint format expected by `build_sam(load_pl=True)`. Auto mode reads an existing auto `results.json`; it does not run the auto detector. The prompt input preserves the existing interactive behavior by using the bbox center and command-line click as positive points.
 
+### Reusable prompt inference service
+
+`services.prompt_inference_service.PromptInferenceService` provides a stateless Python API for CLI, desktop, test, or future server adapters. It does not parse command-line arguments, write JSON, open a GUI, or depend on FastAPI. The model is loaded once by `initialize()` and reused by subsequent `infer()` calls.
+
+```python
+from services.models import InferenceRequest, PromptPoint, PromptServiceConfig
+from services.prompt_inference_service import PromptInferenceService
+
+service = PromptInferenceService(
+    PromptServiceConfig(
+        checkpoint="prompt_interactive.pth",
+        model_config="configs/prompt_instance_spacenet.json",
+        gpu=0,
+        bbox_mode="auto",
+        bbox_size=256,
+    )
+)
+service.initialize()
+
+response = service.infer(
+    InferenceRequest(
+        image_path="data/my_auto_demo/3001001.png",
+        prompts=[
+            PromptPoint(x=500, y=400, label=1),
+            PromptPoint(x=620, y=430, label=0),
+        ],
+        auto_results="work_dir/whumix_auto/results.json",
+        auto_image_id="3001001",
+    )
+)
+print(response.to_dict())
+service.close()
+```
+
+Prompt coordinates and optional request bboxes use the original image pixel coordinate system. An explicit request bbox has highest priority. Otherwise, auto mode selects a detection containing the first positive point and falls back to a boundary-clipped fixed bbox. When `include_bbox_center_prompt=True`, the bbox center is added as an extra positive point to preserve existing interactive behavior. The returned polygon is converted back to original-image coordinates and validated for point count, finite coordinates, closure, and nonzero area.
+
+Run the Linux service checks:
+```shell
+conda activate sampoly
+
+python -c "from services.prompt_inference_service import PromptInferenceService; print('ok')"
+python tools/test_prompt_inference_service.py --help
+
+python tools/test_prompt_inference_service.py \
+  --imgpth path/to/test.png \
+  --checkpoint path/to/prompt_interactive.pth \
+  --config configs/prompt_instance_spacenet.json \
+  --click_x 500 \
+  --click_y 400 \
+  --bbox_mode fixed \
+  --gpu 0
+
+python tools/test_prompt_inference_service.py \
+  --imgpth path/to/test.png \
+  --checkpoint path/to/prompt_interactive.pth \
+  --config configs/prompt_instance_spacenet.json \
+  --click_x 500 \
+  --click_y 400 \
+  --neg_x 620 \
+  --neg_y 430 \
+  --bbox_mode fixed \
+  --gpu 0
+```
+
+The initial service is stateless: each `infer()` call reloads the image and recomputes its embedding. It serializes access to the predictor because the predictor stores mutable image features. Session and embedding reuse are intentionally deferred to a later stage.
+
 ## Dataset Preparation
 ### SpaceNet Vegas Dataset
 We converted the original images of the SpaceNet dataset to 8-bit and the annotations to coco format, and divided them into training, validation, and test sets in the ratio of 8:1:1, which are available for download from [here](https://aistudio.baidu.com/datasetdetail/269168). Place the train, val, test folders in the 'dataset/spacenet' folder.
