@@ -27,7 +27,7 @@ def load_prompt_settings(config_path, checkpoint=None):
     return SimpleNamespace(**settings)
 
 
-def build_prompt_predictor(settings, gpu=0):
+def build_prompt_predictor(settings, gpu=0, device=None):
     import torch
     from segment_anything import SamPredictor, build_sam
 
@@ -35,18 +35,22 @@ def build_prompt_predictor(settings, gpu=0):
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Prompt checkpoint not found: {checkpoint}")
 
-    if gpu >= 0:
+    if device is not None:
+        resolved_device = str(device)
+        if resolved_device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device requested but CUDA is unavailable: {resolved_device}")
+    elif gpu >= 0:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is unavailable. Use a CUDA-enabled environment or pass --gpu -1 for CPU.")
-        device = f"cuda:{gpu}"
+        resolved_device = f"cuda:{gpu}"
     else:
-        device = "cpu"
+        resolved_device = "cpu"
 
     model_args = vars(settings).copy()
     model_args["checkpoint"] = str(checkpoint)
-    sam_model = build_sam(use_poly=True, load_pl=True, **model_args).to(device)
+    sam_model = build_sam(use_poly=True, load_pl=True, **model_args).to(resolved_device)
     sam_model.eval()
-    return SamPredictor(sam_model, polygon=True), device
+    return SamPredictor(sam_model, polygon=True), resolved_device
 
 
 def load_rgb_image(image_path):
@@ -144,6 +148,22 @@ def normalize_bbox(bbox, image_width, image_height):
 
 
 def prepare_crop_prompt(image, bbox, click, crop_margin=0.075):
+    return prepare_crop_prompts(
+        image=image,
+        bbox=bbox,
+        prompts=[(float(click[0]), float(click[1]), 1)],
+        include_bbox_center_prompt=True,
+        crop_margin=crop_margin,
+    )
+
+
+def prepare_crop_prompts(
+    image,
+    bbox,
+    prompts,
+    include_bbox_center_prompt=True,
+    crop_margin=0.1,
+):
     image_height, image_width = image.shape[:2]
     x1, y1, x2, y2 = normalize_bbox(bbox, image_width, image_height)
     bbox_width = x2 - x1
@@ -165,23 +185,62 @@ def prepare_crop_prompt(image, bbox, click, crop_margin=0.075):
         [(crop_bbox[0] + crop_bbox[2]) / 2.0, (crop_bbox[1] + crop_bbox[3]) / 2.0],
         dtype=np.float32,
     )
-    click_point = np.asarray(
-        [float(click[0]) - crop_x1, float(click[1]) - crop_y1],
-        dtype=np.float32,
-    )
-    point_coords = np.stack([bbox_center, click_point], axis=0)
-    point_labels = np.ones(point_coords.shape[0], dtype=np.int32)
+    normalized_prompts = normalize_prompts(prompts, image_width, image_height)
+    point_coords = [
+        np.asarray([x - crop_x1, y - crop_y1], dtype=np.float32)
+        for x, y, _ in normalized_prompts
+    ]
+    point_labels = [label for _, _, label in normalized_prompts]
+    if include_bbox_center_prompt:
+        point_coords.insert(0, bbox_center)
+        point_labels.insert(0, 1)
+
+    point_coords = np.stack(point_coords, axis=0).astype(np.float32)
+    point_labels = np.asarray(point_labels, dtype=np.int32)
     pos_transform = [crop_x1, crop_y1, 1, 1]
     return image_crop, crop_bbox, point_coords, point_labels, pos_transform
 
 
-def infer_single_polygon(predictor, image, bbox, click, multi_mask=True, max_distance=10):
+def normalize_prompts(prompts, image_width, image_height):
+    if not prompts:
+        raise ValueError("At least one prompt point is required.")
+    normalized = []
+    for prompt in prompts:
+        if hasattr(prompt, "x") and hasattr(prompt, "y") and hasattr(prompt, "label"):
+            x, y, label = prompt.x, prompt.y, prompt.label
+        elif isinstance(prompt, (list, tuple)) and len(prompt) == 3:
+            x, y, label = prompt
+        else:
+            raise ValueError("Each prompt must provide x, y, and label values.")
+        x, y = validate_click((x, y), image_width, image_height)
+        label_value = float(label)
+        if not np.isfinite(label_value) or label_value not in (0.0, 1.0):
+            raise ValueError("Prompt label must be 0 (negative) or 1 (positive).")
+        label = int(label_value)
+        normalized.append((x, y, label))
+    if not any(label == 1 for _, _, label in normalized):
+        raise ValueError("At least one positive prompt point is required.")
+    return normalized
+
+
+def infer_polygon_with_prompts(
+    predictor,
+    image,
+    bbox,
+    prompts,
+    include_bbox_center_prompt=True,
+    crop_margin=0.1,
+    multi_mask=True,
+    max_distance=10,
+):
     import torch
 
-    image_crop, crop_bbox, point_coords, point_labels, pos_transform = prepare_crop_prompt(
+    image_crop, crop_bbox, point_coords, point_labels, pos_transform = prepare_crop_prompts(
         image,
         bbox,
-        click,
+        prompts,
+        include_bbox_center_prompt=include_bbox_center_prompt,
+        crop_margin=crop_margin,
     )
     predictor.set_image_resize(image_crop)
     masks, model_scores, _, pred_poly = predictor.predict(
@@ -214,7 +273,21 @@ def infer_single_polygon(predictor, image, bbox, click, multi_mask=True, max_dis
         "model_score": float(model_scores[selected_index]),
         "mask": selected_mask,
         "point_coords": point_coords,
+        "point_labels": point_labels,
     }
+
+
+def infer_single_polygon(predictor, image, bbox, click, multi_mask=True, max_distance=10):
+    return infer_polygon_with_prompts(
+        predictor=predictor,
+        image=image,
+        bbox=bbox,
+        prompts=[(float(click[0]), float(click[1]), 1)],
+        include_bbox_center_prompt=True,
+        crop_margin=0.075,
+        multi_mask=multi_mask,
+        max_distance=max_distance,
+    )
 
 
 def validate_polygon(polygon, image_width, image_height):
