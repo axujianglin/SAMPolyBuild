@@ -119,6 +119,7 @@ selected_auto_info = None
 current_instance_key = None
 interaction_results = {}
 instance_artists = {}
+instance_logits = {}
 prompt_coords = []  # To store prompt point coordinates
 prompt_labels = [1]  # To store prompt point labels (1 or 0). First point is bbox center by default
 defined_bbox = False
@@ -128,6 +129,8 @@ auto_image_id = args.auto_image_id or infer_image_id(args.imgpth)
 
 def reset_interaction():
     global bbox_coords, selected_bbox, selected_auto_info, current_instance_key, prompt_coords, prompt_labels, defined_bbox
+    if current_instance_key is not None:
+        instance_logits.pop(current_instance_key, None)
     bbox_coords = []
     selected_bbox = None
     selected_auto_info = None
@@ -200,11 +203,12 @@ def debug_prompt_state(stage, coords=None, labels=None, extra=None):
         print(f"  {extra}")
 
 
-def predict_with_optional_debug(predictor, point_coords, point_labels, box, multimask_output):
+def predict_with_optional_debug(predictor, point_coords, point_labels, box, multimask_output, mask_input=None):
     kwargs = dict(
         point_coords=point_coords,
         point_labels=point_labels,
         box=box,
+        mask_input=mask_input,
         multimask_output=multimask_output,
     )
     if args.debug_prompt_points:
@@ -372,6 +376,33 @@ def polygon_from_mask(mask, pred_vmap, pred_voff, crop_w, crop_h):
     return polygons[0], scores[0], valid_mask[0]
 
 
+def get_cached_logit(instance_key):
+    if instance_key is None:
+        return None
+    return instance_logits.get(instance_key)
+
+
+def cache_best_logit(instance_key, logit, best_idx):
+    if instance_key is None:
+        return
+    if logit is None:
+        print("[iter_refine] Warning: predictor returned no low-res logit; cache skipped.")
+        return
+    logit_array = np.asarray(logit)
+    if logit_array.ndim != 3:
+        print(f"[iter_refine] Warning: expected logit shape [C,H,W], got {logit_array.shape}; cache skipped.")
+        return
+    if best_idx < 0 or best_idx >= logit_array.shape[0]:
+        print(
+            f"[iter_refine] Warning: best_idx={best_idx} is outside returned logit "
+            f"shape {logit_array.shape}; cache skipped."
+        )
+        return
+    cached_logit = logit_array[best_idx][None, :, :]
+    instance_logits[instance_key] = cached_logit
+    print(f"[iter_refine] cached_logit_shape={cached_logit.shape}")
+
+
 def split_labeled_points(point_coords, point_labels):
     if point_coords is None or point_labels is None:
         return [], []
@@ -532,19 +563,26 @@ def on_key(event):
         # Set image and predict
         predictor.set_image_resize(image_crop)
         debug_prompt_state("before predictor.predict", coords=point, labels=label)
+        mask_input = get_cached_logit(current_instance_key)
+        print(f"[iter_refine] instance={current_instance_key}, using_mask_input={mask_input is not None}")
+        if mask_input is not None:
+            print(f"[iter_refine] mask_input_shape={np.asarray(mask_input).shape}")
         mask, score, logit, pred_poly = predict_with_optional_debug(
             predictor=predictor,
             point_coords=point,
             point_labels=label,
             box=new_bbox,
             multimask_output=args.multi_mask,
+            mask_input=mask_input,
         )
+        print(f"[iter_refine] returned_logit_shape={np.asarray(logit).shape if logit is not None else None}")
         pred_vmap, pred_voff = pred_poly['vmap'], pred_poly['voff']
         pred_vmap = torch.sigmoid(pred_vmap)
         pred_voff = torch.sigmoid(pred_voff)
         crop_w, crop_h = bbox_crop[2] - bbox_crop[0], bbox_crop[3] - bbox_crop[1]
-        if args.multi_mask:
-            mask = mask[np.argmax(score), :, :].reshape(1, crop_h, crop_w)
+        best_idx = int(np.argmax(score)) if args.multi_mask else 0
+        mask = mask[best_idx, :, :].reshape(1, crop_h, crop_w)
+        cache_best_logit(current_instance_key, logit, best_idx)
 
         if args.refine_by_points:
             before_path = join(args.result_pth, "mask_before_point_refine.png")
