@@ -93,6 +93,20 @@ parser.add_argument('--negative_protect_radius', type=int, default=20,
                     help='Radius around positive points that negative feature refinement cannot remove.')
 parser.add_argument('--negative_spatial_sigma', type=float, default=80.0,
                     help='Spatial falloff sigma for negative feature refinement. Use <=0 to disable spatial weighting.')
+parser.add_argument('--negative_same_region_refine', action='store_true',
+                    help='Remove mask pixels with Lab colors similar to negative-point masked patches.')
+parser.add_argument('--negative_patch_radius', type=int, default=10,
+                    help='Patch radius around each negative point for same-region suppression.')
+parser.add_argument('--negative_color_distance_thr', type=float, default=3.0,
+                    help='Normalized Lab distance threshold for negative same-region suppression.')
+parser.add_argument('--negative_same_region_protect_radius', type=int, default=20,
+                    help='Radius around positive points protected from negative same-region suppression.')
+parser.add_argument('--negative_region_max_radius', type=float, default=50.0,
+                    help='Maximum distance from any negative point for same-region suppression. Use <=0 to disable.')
+parser.add_argument('--negative_min_mask_patch_pixels', type=int, default=20,
+                    help='Minimum connected mask pixels required around a valid negative point.')
+parser.add_argument('--negative_max_removed_ratio', type=float, default=0.45,
+                    help='Maximum mask area ratio that same-region suppression may remove before rollback.')
 
 args = load_args(parser,path='configs/prompt_instance_spacenet.json')
 args.result_pth = f'{args.work_dir}/{args.task_name}/'
@@ -120,6 +134,7 @@ current_instance_key = None
 interaction_results = {}
 instance_artists = {}
 instance_logits = {}
+instance_refined_masks = {}
 prompt_coords = []  # To store prompt point coordinates
 prompt_labels = [1]  # To store prompt point labels (1 or 0). First point is bbox center by default
 defined_bbox = False
@@ -131,6 +146,7 @@ def reset_interaction():
     global bbox_coords, selected_bbox, selected_auto_info, current_instance_key, prompt_coords, prompt_labels, defined_bbox
     if current_instance_key is not None:
         instance_logits.pop(current_instance_key, None)
+        instance_refined_masks.pop(current_instance_key, None)
     bbox_coords = []
     selected_bbox = None
     selected_auto_info = None
@@ -403,6 +419,23 @@ def cache_best_logit(instance_key, logit, best_idx):
     print(f"[iter_refine] cached_logit_shape={cached_logit.shape}")
 
 
+def get_cached_refined_mask(instance_key):
+    if instance_key is None:
+        return None
+    cached_mask = instance_refined_masks.get(instance_key)
+    return None if cached_mask is None else cached_mask.copy()
+
+
+def cache_refined_mask(instance_key, mask):
+    if instance_key is None or mask is None:
+        return
+    mask_array = np.asarray(mask)
+    if mask_array.ndim != 3 or mask_array.shape[0] != 1:
+        print(f"[negative_region] Warning: skip refined mask cache with shape {mask_array.shape}.")
+        return
+    instance_refined_masks[instance_key] = mask_array.copy()
+
+
 def split_labeled_points(point_coords, point_labels):
     if point_coords is None or point_labels is None:
         return [], []
@@ -415,6 +448,451 @@ def split_labeled_points(point_coords, point_labels):
         elif int(label_value) == 0:
             negative_points.append(item)
     return positive_points, negative_points
+
+
+def _normalize_mask_shape(mask):
+    mask_array = np.asarray(mask)
+    if mask_array.ndim == 3 and mask_array.shape[0] == 1:
+        return mask_array[0], True
+    if mask_array.ndim == 2:
+        return mask_array, False
+    raise ValueError(f"Expected mask shape (1, H, W) or (H, W), got {mask_array.shape}")
+
+
+def _extract_negative_lab_prototypes(
+    lab_image,
+    search_region,
+    negative_points,
+    patch_radius,
+    min_mask_patch_pixels=20,
+):
+    height, width = search_region.shape
+    prototypes = []
+    skipped_points = []
+    radius = max(1, int(patch_radius))
+    min_pixels = max(1, int(min_mask_patch_pixels))
+    for point in negative_points:
+        x = int(round(float(point[0])))
+        y = int(round(float(point[1])))
+        if not (0 <= x < width and 0 <= y < height):
+            reason = "out_of_bounds"
+            skipped_points.append({"point": (x, y), "reason": reason})
+            print(f"[negative_region] skip negative point={(x, y)}, reason={reason}")
+            continue
+        if not search_region[y, x]:
+            reason = "outside_current_mask"
+            skipped_points.append({"point": (x, y), "reason": reason})
+            print(f"[negative_region] skip negative point={(x, y)}, reason={reason}")
+            continue
+
+        x1 = max(0, x - radius)
+        y1 = max(0, y - radius)
+        x2 = min(width, x + radius + 1)
+        y2 = min(height, y + radius + 1)
+        patch_lab = lab_image[y1:y2, x1:x2]
+        patch_mask = search_region[y1:y2, x1:x2]
+        patch_mask_uint8 = patch_mask.astype(np.uint8)
+        mask_pixels = int(np.count_nonzero(patch_mask_uint8))
+        if mask_pixels < min_pixels:
+            reason = f"insufficient_mask_patch_pixels:{mask_pixels}<{min_pixels}"
+            skipped_points.append({"point": (x, y), "reason": reason})
+            print(f"[negative_region] skip negative point={(x, y)}, reason={reason}")
+            continue
+
+        _, patch_labels = cv2.connectedComponents(patch_mask_uint8, connectivity=8)
+        local_x, local_y = x - x1, y - y1
+        component_id = int(patch_labels[local_y, local_x])
+        component_mask = patch_labels == component_id
+        component_pixels = int(np.count_nonzero(component_mask)) if component_id > 0 else 0
+        if component_pixels < min_pixels:
+            reason = f"sparse_local_component:{component_pixels}<{min_pixels}"
+            skipped_points.append({"point": (x, y), "reason": reason})
+            print(f"[negative_region] skip negative point={(x, y)}, reason={reason}")
+            continue
+
+        pixels = patch_lab[component_mask]
+        source = "masked_local_component"
+        pixels = pixels.astype(np.float32)
+        mean = pixels.mean(axis=0)
+        std = np.maximum(pixels.std(axis=0), 8.0)
+        prototypes.append({
+            "mean": mean,
+            "std": std,
+            "point": (x, y),
+            "source": source,
+            "mask_pixels": component_pixels,
+        })
+    return prototypes, skipped_points
+
+
+def _positive_protect_mask(shape, positive_points, protect_radius):
+    protect_mask = np.zeros(shape, dtype=np.uint8)
+    radius = int(protect_radius)
+    if radius <= 0:
+        return protect_mask.astype(bool)
+    height, width = shape
+    for x, y in positive_points:
+        if 0 <= x < width and 0 <= y < height:
+            cv2.circle(protect_mask, (int(x), int(y)), radius, 1, thickness=-1)
+    return protect_mask.astype(bool)
+
+
+def _negative_radius_mask(shape, negative_points, max_radius):
+    radius_mask = np.ones(shape, dtype=bool)
+    if max_radius is None or float(max_radius) <= 0:
+        return radius_mask, False
+    radius_mask = np.zeros(shape, dtype=np.uint8)
+    radius = int(round(float(max_radius)))
+    height, width = shape
+    for x, y in negative_points:
+        if 0 <= x < width and 0 <= y < height:
+            cv2.circle(radius_mask, (int(x), int(y)), radius, 1, thickness=-1)
+    return radius_mask.astype(bool), True
+
+
+def _negative_connected_similar_mask(negative_similar_mask, negative_points):
+    similar_uint8 = negative_similar_mask.astype(np.uint8)
+    num_components, labels_map = cv2.connectedComponents(similar_uint8, connectivity=8)
+    height, width = negative_similar_mask.shape
+    negative_component_ids = set()
+    for x, y in negative_points:
+        if 0 <= x < width and 0 <= y < height:
+            component_id = int(labels_map[y, x])
+            if component_id > 0:
+                negative_component_ids.add(component_id)
+    if not negative_component_ids:
+        return np.zeros_like(negative_similar_mask, dtype=bool), max(0, num_components - 1), []
+    return np.isin(labels_map, list(negative_component_ids)), max(0, num_components - 1), sorted(negative_component_ids)
+
+
+def _keep_positive_components_or_largest(mask_2d, positive_points):
+    binary_mask = (mask_2d > 0).astype(np.uint8)
+    if np.count_nonzero(binary_mask) == 0:
+        return binary_mask.astype(bool), 0, []
+
+    num_components, labels_map, stats, _ = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
+    component_count = max(0, num_components - 1)
+    height, width = binary_mask.shape
+    positive_components = set()
+    for x, y in positive_points:
+        if 0 <= x < width and 0 <= y < height:
+            component_id = int(labels_map[y, x])
+            if component_id > 0:
+                positive_components.add(component_id)
+
+    if positive_components:
+        keep_components = positive_components
+    elif component_count > 0:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        keep_components = {int(np.argmax(areas)) + 1}
+    else:
+        keep_components = set()
+
+    if not keep_components:
+        return np.zeros_like(binary_mask, dtype=bool), component_count, []
+    return np.isin(labels_map, list(keep_components)), component_count, sorted(keep_components)
+
+
+def _restore_mask_shape(mask_2d, dtype, had_channel_dim):
+    restored = mask_2d.astype(dtype)
+    if had_channel_dim:
+        return restored.reshape(1, restored.shape[0], restored.shape[1])
+    return restored
+
+
+def refine_mask_by_negative_same_region(
+    image_crop,
+    mask,
+    point_coords,
+    point_labels,
+    patch_radius=10,
+    distance_thr=3.0,
+    protect_radius=20,
+    max_radius=50,
+    min_mask_patch_pixels=20,
+    max_removed_ratio=0.45,
+    previous_mask=None,
+    debug=False,
+):
+    mask_array = np.asarray(mask)
+    mask_2d, had_channel_dim = _normalize_mask_shape(mask_array)
+    mask_dtype = mask_array.dtype
+    search_region = mask_2d > 0
+    use_previous_refined_mask = False
+    if previous_mask is not None:
+        try:
+            previous_2d, _ = _normalize_mask_shape(previous_mask)
+            if previous_2d.shape == search_region.shape and np.count_nonzero(previous_2d) > 0:
+                search_region = previous_2d > 0
+                use_previous_refined_mask = True
+            else:
+                print(
+                    "[negative_region] Warning: previous refined mask is empty or has an incompatible "
+                    f"shape {previous_2d.shape}; using current model mask."
+                )
+        except ValueError as exc:
+            print(f"[negative_region] Warning: invalid previous refined mask; using current model mask: {exc}")
+    original_mask = search_region.copy()
+    mask_area_before = int(np.count_nonzero(original_mask))
+
+    positive_points, negative_points = split_labeled_points(point_coords, point_labels)
+    user_positive_points = []
+    if point_coords is not None and point_labels is not None:
+        for index, (point, label_value) in enumerate(zip(point_coords, point_labels)):
+            if index > 0 and int(label_value) == 1:
+                user_positive_points.append(
+                    (int(round(float(point[0]))), int(round(float(point[1]))))
+                )
+    subject_positive_points = user_positive_points or positive_points
+    if not negative_points:
+        if debug:
+            print("[negative_region] no negative points, skip")
+        return mask
+    if mask_area_before == 0:
+        print("[negative_region] Warning: input mask is empty; using original mask.")
+        return mask
+
+    lab_image = cv2.cvtColor(image_crop, cv2.COLOR_RGB2LAB)
+    prototypes, skipped_negative_points = _extract_negative_lab_prototypes(
+        lab_image,
+        search_region,
+        negative_points,
+        patch_radius,
+        min_mask_patch_pixels=min_mask_patch_pixels,
+    )
+    valid_negative_points = [prototype["point"] for prototype in prototypes]
+    if not prototypes:
+        fallback_reason = "no_valid_negative_points"
+        print("[negative_region] Warning: no valid negative prototypes; using previous refined mask.")
+        if debug:
+            _print_negative_region_debug(
+                negative_points, prototypes, mask_area_before,
+                np.zeros_like(search_region, dtype=bool),
+                np.zeros_like(search_region, dtype=bool), original_mask, 0, [],
+                fallback=True, valid_negative_points=valid_negative_points,
+                skipped_negative_points=skipped_negative_points,
+                fallback_reason=fallback_reason,
+                use_previous_refined_mask=use_previous_refined_mask,
+            )
+        return _restore_mask_shape(original_mask, mask_dtype, had_channel_dim)
+
+    ys, xs = np.where(search_region)
+    lab_pixels = lab_image[ys, xs].astype(np.float32)
+    negative_similar_pixels = np.zeros(xs.shape[0], dtype=bool)
+    for prototype in prototypes:
+        normalized = (lab_pixels - prototype["mean"].reshape(1, 3)) / prototype["std"].reshape(1, 3)
+        distances = np.sqrt((normalized ** 2).sum(axis=1))
+        negative_similar_pixels |= distances <= float(distance_thr)
+
+    negative_similar_mask = np.zeros_like(search_region, dtype=bool)
+    negative_similar_mask[ys[negative_similar_pixels], xs[negative_similar_pixels]] = True
+    negative_component_mask, similar_component_count, neg_component_ids = _negative_connected_similar_mask(
+        negative_similar_mask,
+        valid_negative_points,
+    )
+    if not neg_component_ids:
+        fallback_reason = "no_reliable_negative_component"
+        print("[negative_region] Warning: no negative point falls inside a similar component; using previous refined mask.")
+        if debug:
+            _print_negative_region_debug(
+                negative_points, prototypes, mask_area_before, negative_similar_mask,
+                np.zeros_like(search_region, dtype=bool), original_mask, 0, [],
+                fallback=True, similar_component_count=similar_component_count,
+                neg_component_ids=neg_component_ids, radius_limited=False,
+                radius_pixels=0, positive_protect_pixels=0,
+                removed_pixels_before_component_filter=0,
+                valid_negative_points=valid_negative_points,
+                skipped_negative_points=skipped_negative_points,
+                fallback_reason=fallback_reason,
+                use_previous_refined_mask=use_previous_refined_mask,
+            )
+        return _restore_mask_shape(original_mask, mask_dtype, had_channel_dim)
+
+    radius_mask, radius_limited = _negative_radius_mask(search_region.shape, valid_negative_points, max_radius)
+    positive_protect = _positive_protect_mask(
+        search_region.shape,
+        subject_positive_points,
+        protect_radius,
+    )
+    remove_before_component_filter = negative_similar_mask & search_region & (~positive_protect)
+    remove_mask = negative_component_mask & search_region & radius_mask & (~positive_protect)
+
+    refined_mask = search_region.copy()
+    refined_mask[remove_mask] = False
+    if np.count_nonzero(refined_mask) == 0:
+        fallback_reason = "empty_after_suppression"
+        print("[negative_region] Warning: same-region suppression removed all mask pixels; using previous refined mask.")
+        if debug:
+            _print_negative_region_debug(
+                negative_points, prototypes, mask_area_before, negative_similar_mask,
+                remove_mask, original_mask, 0, [], fallback=True,
+                similar_component_count=similar_component_count,
+                neg_component_ids=neg_component_ids,
+                radius_limited=radius_limited,
+                radius_pixels=int(np.count_nonzero(radius_mask & search_region)),
+                positive_protect_pixels=int(np.count_nonzero(positive_protect)),
+                removed_pixels_before_component_filter=int(np.count_nonzero(remove_before_component_filter)),
+                valid_negative_points=valid_negative_points,
+                skipped_negative_points=skipped_negative_points,
+                fallback_reason=fallback_reason,
+                use_previous_refined_mask=use_previous_refined_mask,
+            )
+        return _restore_mask_shape(original_mask, mask_dtype, had_channel_dim)
+
+    refined_mask = cv2.morphologyEx(
+        refined_mask.astype(np.uint8),
+        cv2.MORPH_CLOSE,
+        np.ones((3, 3), dtype=np.uint8),
+        iterations=1,
+    ).astype(bool)
+
+    refined_mask, component_count_after, keep_components = _keep_positive_components_or_largest(
+        refined_mask,
+        subject_positive_points,
+    )
+    if np.count_nonzero(refined_mask) == 0:
+        fallback_reason = "empty_after_component_filter"
+        print("[negative_region] Warning: component filtering removed all mask pixels; using previous refined mask.")
+        if debug:
+            _print_negative_region_debug(
+                negative_points, prototypes, mask_area_before, negative_similar_mask,
+                remove_mask, original_mask, component_count_after, keep_components, fallback=True,
+                similar_component_count=similar_component_count,
+                neg_component_ids=neg_component_ids,
+                radius_limited=radius_limited,
+                radius_pixels=int(np.count_nonzero(radius_mask & search_region)),
+                positive_protect_pixels=int(np.count_nonzero(positive_protect)),
+                removed_pixels_before_component_filter=int(np.count_nonzero(remove_before_component_filter)),
+                valid_negative_points=valid_negative_points,
+                skipped_negative_points=skipped_negative_points,
+                fallback_reason=fallback_reason,
+                use_previous_refined_mask=use_previous_refined_mask,
+            )
+        return _restore_mask_shape(original_mask, mask_dtype, had_channel_dim)
+
+    height, width = refined_mask.shape
+    lost_positive_points = [
+        (x, y) for x, y in subject_positive_points
+        if not (0 <= x < width and 0 <= y < height and refined_mask[y, x])
+    ]
+    mask_area_after = int(np.count_nonzero(refined_mask))
+    removed_ratio = (mask_area_before - mask_area_after) / max(mask_area_before, 1)
+    fallback_reason = None
+    if lost_positive_points:
+        fallback_reason = "positive_point_lost"
+        print(
+            "[negative_region][warning] positive point lost, fallback: "
+            f"{lost_positive_points}"
+        )
+    elif removed_ratio > float(max_removed_ratio):
+        fallback_reason = "removed_ratio_too_large"
+        print(
+            "[negative_region][warning] removed_ratio too large, fallback: "
+            f"{removed_ratio:.4f}>{float(max_removed_ratio):.4f}"
+        )
+
+    if fallback_reason is not None:
+        if debug:
+            _print_negative_region_debug(
+                negative_points, prototypes, mask_area_before, negative_similar_mask,
+                remove_mask, refined_mask, component_count_after, keep_components, fallback=True,
+                similar_component_count=similar_component_count,
+                neg_component_ids=neg_component_ids,
+                radius_limited=radius_limited,
+                radius_pixels=int(np.count_nonzero(radius_mask & search_region)),
+                positive_protect_pixels=int(np.count_nonzero(positive_protect)),
+                removed_pixels_before_component_filter=int(np.count_nonzero(remove_before_component_filter)),
+                valid_negative_points=valid_negative_points,
+                skipped_negative_points=skipped_negative_points,
+                removed_ratio=removed_ratio,
+                fallback_reason=fallback_reason,
+                use_previous_refined_mask=use_previous_refined_mask,
+            )
+        return _restore_mask_shape(original_mask, mask_dtype, had_channel_dim)
+
+    if debug:
+        _print_negative_region_debug(
+            negative_points, prototypes, mask_area_before, negative_similar_mask,
+            remove_mask, refined_mask, component_count_after, keep_components, fallback=False,
+            similar_component_count=similar_component_count,
+            neg_component_ids=neg_component_ids,
+            radius_limited=radius_limited,
+            radius_pixels=int(np.count_nonzero(radius_mask & search_region)),
+            positive_protect_pixels=int(np.count_nonzero(positive_protect)),
+            removed_pixels_before_component_filter=int(np.count_nonzero(remove_before_component_filter)),
+            valid_negative_points=valid_negative_points,
+            skipped_negative_points=skipped_negative_points,
+            removed_ratio=removed_ratio,
+            fallback_reason=None,
+            use_previous_refined_mask=use_previous_refined_mask,
+        )
+
+    return _restore_mask_shape(refined_mask, mask_dtype, had_channel_dim)
+
+
+def _print_negative_region_debug(
+    negative_points,
+    prototypes,
+    mask_area_before,
+    negative_similar_mask,
+    remove_mask,
+    refined_mask,
+    component_count_after,
+    keep_components,
+    fallback,
+    similar_component_count=0,
+    neg_component_ids=None,
+    radius_limited=False,
+    radius_pixels=0,
+    positive_protect_pixels=0,
+    removed_pixels_before_component_filter=0,
+    valid_negative_points=None,
+    skipped_negative_points=None,
+    removed_ratio=None,
+    fallback_reason=None,
+    use_previous_refined_mask=False,
+):
+    if neg_component_ids is None:
+        neg_component_ids = []
+    if valid_negative_points is None:
+        valid_negative_points = []
+    if skipped_negative_points is None:
+        skipped_negative_points = []
+    means = [prototype["mean"].round(2).tolist() for prototype in prototypes]
+    stds = [prototype["std"].round(2).tolist() for prototype in prototypes]
+    sources = [prototype["source"] for prototype in prototypes]
+    print("[negative_region] enabled=True")
+    print(f"[negative_region] negative_points={negative_points}")
+    print(f"[negative_region] valid_negative_points={valid_negative_points}")
+    print(f"[negative_region] skipped_negative_points={skipped_negative_points}")
+    print(f"[negative_region] prototype_count={len(prototypes)}")
+    print(f"[negative_region] prototype_lab_mean={means}")
+    print(f"[negative_region] prototype_lab_std={stds}")
+    print(f"[negative_region] prototype_sources={sources}")
+    print("[negative_region] positive protection prefers user positive points; bbox center is fallback-only.")
+    print(f"[negative_region] mask_area_before={mask_area_before}")
+    print(f"[negative_region] negative_similar_pixels={int(np.count_nonzero(negative_similar_mask))}")
+    print(f"[negative_region] similar_component_count={similar_component_count}")
+    print(f"[negative_region] neg_component_ids={neg_component_ids}")
+    print(f"[negative_region] radius_limited={radius_limited}")
+    print(f"[negative_region] radius_pixels={radius_pixels}")
+    print(f"[negative_region] positive_protect_pixels={positive_protect_pixels}")
+    print(f"[negative_region] removed_pixels_before_component_filter={removed_pixels_before_component_filter}")
+    print(f"[negative_region] removed_pixels_after_component_filter={int(np.count_nonzero(remove_mask))}")
+    print(f"[negative_region] mask_area_after={int(np.count_nonzero(refined_mask))}")
+    if removed_ratio is None:
+        removed_ratio = (
+            (mask_area_before - int(np.count_nonzero(refined_mask)))
+            / max(mask_area_before, 1)
+        )
+    print(f"[negative_region] area_before={mask_area_before}")
+    print(f"[negative_region] area_after={int(np.count_nonzero(refined_mask))}")
+    print(f"[negative_region] removed_ratio={removed_ratio:.4f}")
+    print(f"[negative_region] component_count_after={component_count_after}")
+    print(f"[negative_region] keep_components={keep_components}")
+    print(f"[negative_region] fallback={fallback}")
+    print(f"[negative_region] fallback_reason={fallback_reason}")
+    print(f"[negative_region] use_previous_refined_mask={use_previous_refined_mask}")
 
 
 def save_interaction_result(instance_key, bbox, prompt_points, labels, polygon, mask):
@@ -596,6 +1074,23 @@ def on_key(event):
             if refined:
                 print(f"Point refinement debug masks saved: {before_path}, {after_path}, {regions_path}")
 
+        if args.negative_same_region_refine:
+            previous_refined_mask = get_cached_refined_mask(current_instance_key)
+            mask = refine_mask_by_negative_same_region(
+                image_crop=image_crop,
+                mask=mask,
+                point_coords=point,
+                point_labels=label,
+                patch_radius=args.negative_patch_radius,
+                distance_thr=args.negative_color_distance_thr,
+                protect_radius=args.negative_same_region_protect_radius,
+                max_radius=args.negative_region_max_radius,
+                min_mask_patch_pixels=args.negative_min_mask_patch_pixels,
+                max_removed_ratio=args.negative_max_removed_ratio,
+                previous_mask=previous_refined_mask,
+                debug=args.debug_prompt_points,
+            )
+
         polygon_before_feature_refine = None
         if args.negative_feature_refine:
             before_feature_mask = mask[0].copy()
@@ -615,6 +1110,7 @@ def on_key(event):
             print(feature_refine["message"])
 
         # Post-process from the final mask, after all enabled refinements.
+        cache_refined_mask(current_instance_key, mask)
         polygon_crop, score, _ = polygon_from_mask(mask, pred_vmap, pred_voff, crop_w, crop_h)
         if args.negative_feature_refine:
             save_negative_feature_debug(
