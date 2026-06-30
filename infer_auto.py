@@ -55,7 +55,7 @@ def run_auto_inference(
                                                  dict(type='CocoMetric',
                                             result_pth=result_pth,
                                             evaluate=False,
-                                            score_thr=args.score_thr,
+                                            score_thr=score_thr,
                                             result_type=['mask','polygon'])
                                     )
     max_per_img=100
