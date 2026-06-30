@@ -5,15 +5,54 @@ import numpy as np
 
 try:
     import rasterio
+    from rasterio.enums import ColorInterp
     from rasterio.transform import Affine
     from rasterio.windows import Window
 except ImportError as exc:  # Keep CLI help importable when the optional dependency is absent.
     rasterio = None
+    ColorInterp = None
     Affine = None
     Window = None
     _RASTERIO_IMPORT_ERROR = exc
 else:
     _RASTERIO_IMPORT_ERROR = None
+
+
+def compute_valid_mask(tile, nodata=None, alpha=None, background_mode="auto") -> np.ndarray:
+    """Return a 2D valid-pixel mask using alpha, nodata, or RGB background."""
+    tile_array = np.asarray(tile)
+    if tile_array.ndim != 3 or tile_array.shape[2] < 1:
+        raise ValueError(f"Expected tile shape (H, W, C), got {tile_array.shape}.")
+
+    height, width = tile_array.shape[:2]
+    if alpha is not None:
+        alpha_array = np.asarray(alpha)
+        if alpha_array.ndim == 3 and alpha_array.shape[2] == 1:
+            alpha_array = alpha_array[:, :, 0]
+        if alpha_array.shape != (height, width):
+            raise ValueError(
+                f"Alpha shape {alpha_array.shape} does not match tile shape {(height, width)}."
+            )
+        return alpha_array > 0
+
+    color_bands = tile_array[:, :, :3] if tile_array.shape[2] >= 3 else tile_array
+    if nodata is not None:
+        if isinstance(nodata, (float, np.floating)) and np.isnan(nodata):
+            invalid = np.all(np.isnan(color_bands), axis=2)
+        else:
+            invalid = np.all(color_bands == nodata, axis=2)
+        return ~invalid
+
+    if background_mode in (None, "none"):
+        return np.ones((height, width), dtype=bool)
+    if background_mode != "auto":
+        raise ValueError(
+            f"Unsupported background_mode={background_mode!r}; expected 'auto' or 'none'."
+        )
+
+    all_zero = np.all(color_bands == 0, axis=2)
+    all_white = np.all(color_bands == 255, axis=2)
+    return ~(all_zero | all_white)
 
 
 class ImageTileReader:
@@ -54,6 +93,12 @@ class ImageTileReader:
             self.dtype = selected_dtypes[0]
             self.crs = self._dataset.crs
             self.transform = self._dataset.transform
+            alpha_bands = [
+                index + 1
+                for index, interpretation in enumerate(self._dataset.colorinterp)
+                if interpretation == ColorInterp.alpha
+            ]
+            self.alpha_band = alpha_bands[0] if alpha_bands else None
             self.band_nodata = tuple(
                 self._dataset.nodatavals[band - 1] for band in self.bands
             )
@@ -113,6 +158,36 @@ class ImageTileReader:
                 f"Window read returned shape {tile_chw.shape}, expected {expected_shape}."
             )
         return np.moveaxis(tile_chw, 0, -1)
+
+    def read_tile_with_valid_mask(
+        self,
+        x_offset,
+        y_offset,
+        width,
+        height,
+        background_mode="auto",
+    ):
+        """Read one tile and compute its valid mask from the same window."""
+        self._require_open()
+        x_offset, y_offset, width, height = self._validate_window(
+            x_offset, y_offset, width, height
+        )
+        tile = self.read_tile(x_offset, y_offset, width, height)
+        alpha = None
+        if self.alpha_band is not None:
+            window = Window(x_offset, y_offset, width, height)
+            alpha = self._dataset.read(indexes=self.alpha_band, window=window)
+            if alpha.shape != (height, width):
+                raise RuntimeError(
+                    f"Alpha window returned shape {alpha.shape}, expected {(height, width)}."
+                )
+        valid_mask = compute_valid_mask(
+            tile,
+            nodata=self.nodata,
+            alpha=alpha,
+            background_mode=background_mode,
+        )
+        return tile, valid_mask
 
     def tile_transform(self, x_offset, y_offset):
         """Return the affine transform for a tile origin."""
