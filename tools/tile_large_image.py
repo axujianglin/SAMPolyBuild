@@ -1,7 +1,7 @@
 import argparse
 import json
-import math
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -33,12 +33,22 @@ def parse_args():
     parser.add_argument("--overlap", type=int, default=128, help="Overlap between adjacent tiles.")
     parser.add_argument("--prefix", default=None, help="Tile name prefix; defaults to input stem.")
     parser.add_argument("--bands", type=parse_bands, default=(1, 2, 3), help="Bands, e.g. 1,2,3.")
-    parser.add_argument("--skip_empty", action="store_true", help="Skip mostly nodata/black/white tiles.")
+    parser.add_argument(
+        "--skip_empty",
+        action="store_true",
+        help="Compatibility flag for skipping tiles whose invalid ratio exceeds --empty_threshold.",
+    )
     parser.add_argument(
         "--empty_threshold",
         type=float,
         default=0.98,
         help="Pixel ratio above which a tile is considered empty.",
+    )
+    parser.add_argument(
+        "--min_valid_ratio",
+        type=float,
+        default=0.25,
+        help="Skip tiles with a lower valid-pixel ratio; use 0 to disable filtering.",
     )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing tiles and manifest.")
     return parser.parse_args()
@@ -76,26 +86,21 @@ def crs_to_string(crs):
     return f"EPSG:{epsg}" if epsg is not None else crs.to_wkt()
 
 
-def empty_tile_reason(tile, nodata, threshold):
-    pixel_count = tile.shape[0] * tile.shape[1]
-    if pixel_count == 0:
-        return "empty_window"
+def valid_pixel_stats(valid_mask):
+    valid_array = np.asarray(valid_mask, dtype=bool)
+    if valid_array.ndim != 2:
+        raise ValueError(f"Expected valid mask shape (H, W), got {valid_array.shape}.")
+    total_pixels = int(valid_array.size)
+    valid_pixels = int(np.count_nonzero(valid_array))
+    valid_ratio = valid_pixels / total_pixels if total_pixels else 0.0
+    return valid_pixels, total_pixels, valid_ratio
 
-    if nodata is not None:
-        if isinstance(nodata, float) and math.isnan(nodata):
-            nodata_pixels = np.all(np.isnan(tile), axis=2)
-        else:
-            nodata_pixels = np.all(tile == nodata, axis=2)
-        if np.count_nonzero(nodata_pixels) / pixel_count > threshold:
-            return "nodata"
 
-    zero_pixels = np.all(tile == 0, axis=2)
-    if np.count_nonzero(zero_pixels) / pixel_count > threshold:
-        return "all_zero"
-
-    white_pixels = np.all(tile == 255, axis=2)
-    if np.count_nonzero(white_pixels) / pixel_count > threshold:
-        return "all_255"
+def tile_skip_reason(valid_ratio, min_valid_ratio, skip_empty, empty_threshold):
+    if min_valid_ratio > 0 and valid_ratio < min_valid_ratio:
+        return "valid_ratio_below_threshold"
+    if skip_empty and valid_ratio < (1.0 - empty_threshold):
+        return "empty_tile"
     return None
 
 
@@ -128,6 +133,8 @@ def validate_args(args):
         raise ValueError("--overlap must satisfy 0 <= overlap < tile_size.")
     if not 0.0 <= args.empty_threshold <= 1.0:
         raise ValueError("--empty_threshold must be between 0 and 1.")
+    if not 0.0 <= args.min_valid_ratio <= 1.0:
+        raise ValueError("--min_valid_ratio must be between 0 and 1.")
     if not args.prefix:
         args.prefix = Path(args.input).stem
     if Path(args.prefix).name != args.prefix or args.prefix in (".", ".."):
@@ -157,8 +164,12 @@ def run(args):
         remove_existing_prefix_tiles(tiles_dir, args.prefix)
 
     tiles = []
-    skipped_count = 0
-    edge_tile_count = 0
+    skipped_tiles = []
+    skip_reasons = Counter()
+    candidate_valid_ratios = []
+    written_valid_ratios = []
+    candidate_edge_tile_count = 0
+    written_edge_tile_count = 0
     with ImageTileReader(input_path, bands=args.bands) as reader:
         planned_windows = list(
             iter_tile_windows(reader.width, reader.height, args.tile_size, stride)
@@ -182,6 +193,7 @@ def run(args):
             "height": reader.height,
             "count": reader.count,
             "bands": list(reader.bands),
+            "alpha_band": reader.alpha_band,
             "dtype": reader.dtype,
             "crs": source_crs,
             "transform": affine_to_list(reader.transform),
@@ -199,20 +211,47 @@ def run(args):
         print(f"stride: {stride}")
 
         for x_offset, y_offset, width, height in planned_windows:
-            tile = reader.read_tile(x_offset, y_offset, width, height)
-            if args.skip_empty:
-                reason = empty_tile_reason(tile, reader.nodata, args.empty_threshold)
-                if reason is not None:
-                    skipped_count += 1
-                    continue
-
             tile_id = f"{args.prefix}_x{x_offset:06d}_y{y_offset:06d}"
             file_name = f"{tile_id}.tif"
+            is_edge = width < args.tile_size or height < args.tile_size
+            candidate_edge_tile_count += int(is_edge)
+            tile, valid_mask = reader.read_tile_with_valid_mask(
+                x_offset,
+                y_offset,
+                width,
+                height,
+            )
+            valid_pixels, total_pixels, valid_ratio = valid_pixel_stats(valid_mask)
+            candidate_valid_ratios.append(valid_ratio)
+            skip_reason = tile_skip_reason(
+                valid_ratio,
+                args.min_valid_ratio,
+                args.skip_empty,
+                args.empty_threshold,
+            )
+            if skip_reason is not None:
+                skip_reasons[skip_reason] += 1
+                skipped_tiles.append({
+                    "tile_id": tile_id,
+                    "file_name": file_name,
+                    "x_offset": x_offset,
+                    "y_offset": y_offset,
+                    "width": width,
+                    "height": height,
+                    "is_edge": is_edge,
+                    "valid_pixels": valid_pixels,
+                    "total_pixels": total_pixels,
+                    "valid_ratio": round(valid_ratio, 6),
+                    "skipped": True,
+                    "skip_reason": skip_reason,
+                })
+                continue
+
             tile_path = tiles_dir / file_name
             profile = reader.tile_profile(x_offset, y_offset, width, height)
             write_tile(tile_path, tile, profile)
-            is_edge = width < args.tile_size or height < args.tile_size
-            edge_tile_count += int(is_edge)
+            written_edge_tile_count += int(is_edge)
+            written_valid_ratios.append(valid_ratio)
             tiles.append({
                 "tile_id": tile_id,
                 "file_name": file_name,
@@ -224,10 +263,12 @@ def run(args):
                 "is_edge": is_edge,
                 "crs": source_crs,
                 "transform": affine_to_list(profile["transform"]),
+                "valid_pixels": valid_pixels,
+                "total_pixels": total_pixels,
+                "valid_ratio": round(valid_ratio, 6),
+                "skipped": False,
+                "skip_reason": None,
             })
-
-    if not tiles:
-        raise RuntimeError("No tiles were written; check --skip_empty and --empty_threshold.")
 
     actual_tiles = [
         path for path in tiles_dir.glob("*.tif")
@@ -238,15 +279,41 @@ def run(args):
             f"Manifest has {len(tiles)} tiles but found {len(actual_tiles)} tile files."
         )
 
-    manifest = {"source": source, "tiles": tiles}
+    summary = {
+        "candidate_tiles": len(planned_windows),
+        "written_tiles": len(tiles),
+        "skipped_tiles": len(skipped_tiles),
+        "candidate_edge_tiles": candidate_edge_tile_count,
+        "written_edge_tiles": written_edge_tile_count,
+        "min_valid_ratio": args.min_valid_ratio,
+        "mean_valid_ratio_candidate": round(float(np.mean(candidate_valid_ratios)), 6),
+        "mean_valid_ratio_written": (
+            round(float(np.mean(written_valid_ratios)), 6)
+            if written_valid_ratios else 0.0
+        ),
+        "skip_reasons": dict(skip_reasons),
+    }
+    manifest = {
+        "source": source,
+        "summary": summary,
+        "tiles": tiles,
+        "skipped_tiles": skipped_tiles,
+    }
     temporary_manifest = manifest_path.with_suffix(".json.tmp")
     with temporary_manifest.open("w", encoding="utf-8") as stream:
         json.dump(manifest, stream, ensure_ascii=False, indent=2)
     temporary_manifest.replace(manifest_path)
 
-    print(f"tile count: {len(tiles)}")
-    print(f"edge tile count: {edge_tile_count}")
-    print(f"skipped empty tile count: {skipped_count}")
+    print(f"candidate tiles: {len(planned_windows)}")
+    print(f"written tiles: {len(tiles)}")
+    print(f"skipped tiles: {len(skipped_tiles)}")
+    print(f"edge tiles: {written_edge_tile_count}")
+    print(f"min_valid_ratio: {args.min_valid_ratio}")
+    print(f"mean valid_ratio written: {summary['mean_valid_ratio_written']:.6f}")
+    if skip_reasons:
+        print("top skip reasons:")
+        for reason, count in skip_reasons.most_common():
+            print(f"  {reason}: {count}")
     print(f"manifest path: {manifest_path}")
     return manifest
 
