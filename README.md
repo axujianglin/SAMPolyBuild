@@ -68,6 +68,20 @@ Show the predicted polygons and masks on the images (change the img_dir, dt_pth 
 python utils/show_pred.py
 ```
 
+To draw only the Auto polygons over one source image in a single canvas, use
+the standalone CLI below. It saves a PNG by default and opens a Matplotlib
+window when `--show` is supplied. This utility reads the existing
+`results.json`; it does not load or modify the model.
+
+```shell
+python tools/visualize_auto_polygons.py \
+  --image dataset/WHU-data/image001.tiff \
+  --results work_dir/whu_single/whumix_auto/results.json \
+  --output work_dir/whu_single/whumix_auto/polygon_overlay.png \
+  --score-threshold 0.1 \
+  --show
+```
+
 ### Auto bbox + prompt interaction
 Auto mode can be used as a full-image building bbox provider, while prompt mode performs single-building interactive polygon refinement. This does not use `utils/auto_bbox.py`; it reuses the `infer_auto.py` output.
 
