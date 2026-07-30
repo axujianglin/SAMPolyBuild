@@ -357,10 +357,29 @@ python review_tiles.py \
 Prompt-first controls:
 
 - `Left click`: start a building or add a positive point
-- `Right click`: add a negative point
+- `Right click`: add a negative point. By default, points outside the current preview polygon/mask are ignored. Use `--allow-outside-negative-points` to override this.
 - `Enter`: accept the current Prompt polygon and save it
 - `C` or `Esc`: cancel the running Prompt session
 - `R`: keep using Refine on a selected confirmed polygon in select-first mode
+
+Negative-point iterative refine options:
+
+- `--debug-prompt-points`: print ordered points, labels, and predictor inputs
+- `--refine-by-points` / `--no-refine-by-points`: enable or disable point-guided mask refinement
+- `--point-refine-mode distance|connected_component`: choose point-guided refinement mode
+- `--negative-feature-refine`: enable negative-point feature suppression
+- `--negative-similarity-thr`
+- `--negative-feature-patch-size`
+- `--negative-protect-radius`
+- `--negative-spatial-sigma`
+- `--negative-point-tolerance`: accept clicks slightly outside the preview polygon boundary
+- `--max-polygon-points`
+- `--min-polygon-area`
+- `--max-area-change-ratio`
+- `--min-area-change-ratio`
+- `--reject-invalid-refine` / `--no-reject-invalid-refine`
+- `--allow-outside-negative-points`: allow external negative points to participate in Prompt updates
+- `--debug-refine-dir`: save per-step prompt debug JSON and mask/polygon images
 
 ## Dataset Preparation
 ### SpaceNet Vegas Dataset

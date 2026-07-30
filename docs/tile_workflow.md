@@ -251,7 +251,7 @@ left click building
   -> fall back to fixed bbox when allowed
   -> run Prompt and show preview polygon
   -> left click adds positive points
-  -> right click adds negative points
+  -> right click adds negative points only when they fall inside the current preview polygon/mask by default
   -> Enter saves the final prompt polygon
   -> C / Esc cancels the running prompt session
 ```
@@ -283,4 +283,51 @@ python review_tiles.py \
   --auto-results path/to/output/auto_results \
   --edited-results path/to/output/edited_results \
   --default-mode select
+```
+
+## Negative-point iterative refine
+
+Stage 8 fixes negative-point review by carrying ordered prompt clicks, labels,
+point-guided mask refinement, and optional negative-feature refinement through
+the Prompt-first and Refine sessions. Outside negative points are ignored by
+default and can be re-enabled with `--allow-outside-negative-points`. The
+preview-polygon boundary tolerance is controlled by `--negative-point-tolerance`.
+Refine preview replacement is now guarded by polygon quality gates such as
+point-count, area-ratio, and bbox-overlap checks.
+
+Recommended review command:
+
+```bash
+python review_tiles.py \
+  --manifest work_dir/tile_auto_austin1/manifests/manifest.json \
+  --auto-results work_dir/tile_auto_austin1/auto_results \
+  --edited-results work_dir/tile_auto_austin1/edited_results \
+  --config configs/prompt_instance_spacenet.json \
+  --checkpoint checkpoints/prompt_interactive.pth \
+  --device cuda:0 \
+  --refine-by-points \
+  --point-refine-mode distance \
+  --debug-prompt-points \
+  --debug-refine-dir work_dir/debug_refine
+```
+
+Optional negative-feature refinement:
+
+```bash
+python review_tiles.py \
+  --manifest work_dir/tile_auto_austin1/manifests/manifest.json \
+  --auto-results work_dir/tile_auto_austin1/auto_results \
+  --edited-results work_dir/tile_auto_austin1/edited_results \
+  --config configs/prompt_instance_spacenet.json \
+  --checkpoint checkpoints/prompt_interactive.pth \
+  --device cuda:0 \
+  --refine-by-points \
+  --point-refine-mode distance \
+  --negative-feature-refine \
+  --negative-similarity-thr 0.75 \
+  --negative-feature-patch-size 21 \
+  --negative-protect-radius 20 \
+  --negative-spatial-sigma 80 \
+  --debug-prompt-points \
+  --debug-refine-dir work_dir/debug_refine
 ```

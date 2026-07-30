@@ -15,6 +15,7 @@ from workflow.prompt_infer_adapter import (
     run_prompt_inference_on_tile,
 )
 from workflow.prompt_review_session import PromptReviewSession
+from workflow.refine_polygon_validation import RefinePolygonValidationConfig
 from workflow.refine_session import RefineSession
 from workflow.tile_review import (
     add_click_polygon,
@@ -34,7 +35,7 @@ HELP_TEXT = """Tile review shortcuts:
   N / Right Arrow  save and open next tile
   P / Left Arrow   save and open previous tile
   Left click       in Prompt mode: start a building or add a positive point
-  Right click      in Prompt mode: add a negative point to the running building
+  Right click      in Prompt/Refine mode: add a negative point to the running building
   Enter            accept the running Prompt/Refine session
   C / Esc          cancel the running Prompt session
   A                enter Add mode for a missed building
@@ -120,6 +121,77 @@ def parse_args() -> argparse.Namespace:
         "--mock-prompt", action="store_true",
         help="Generate a deterministic rectangle without loading a model.",
     )
+    parser.add_argument(
+        "--debug-prompt-points", action="store_true",
+        help="Print prompt point coordinates and labels through the review prediction chain.",
+    )
+    parser.add_argument(
+        "--refine-by-points",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable point-guided mask refinement before polygon extraction.",
+    )
+    parser.add_argument(
+        "--point-refine-mode",
+        choices=("connected_component", "distance"),
+        default="distance",
+        help="Point-guided refinement mode used when --refine-by-points is enabled.",
+    )
+    parser.add_argument(
+        "--negative-feature-refine", action="store_true",
+        help="Use negative-point feature prototypes to remove visually similar mask pixels.",
+    )
+    parser.add_argument(
+        "--negative-similarity-thr", type=float, default=0.75,
+        help="Similarity threshold for negative feature refinement.",
+    )
+    parser.add_argument(
+        "--negative-feature-patch-size", type=int, default=21,
+        help="Patch size around each negative point for feature prototype extraction.",
+    )
+    parser.add_argument(
+        "--negative-protect-radius", type=int, default=20,
+        help="Radius around positive points protected from negative feature refinement.",
+    )
+    parser.add_argument(
+        "--negative-spatial-sigma", type=float, default=80.0,
+        help="Spatial falloff sigma for negative feature refinement. Use <=0 to disable weighting.",
+    )
+    parser.add_argument(
+        "--debug-refine-dir", default=None,
+        help="Optional debug output directory. Defaults to work_dir/debug_refine when debugging is enabled.",
+    )
+    parser.add_argument(
+        "--allow-outside-negative-points",
+        action="store_true",
+        help="Allow right-click negative points outside the current preview polygon or mask.",
+    )
+    parser.add_argument(
+        "--negative-point-tolerance", type=float, default=5.0,
+        help="Allow negative points up to this many pixels outside the preview polygon boundary.",
+    )
+    parser.add_argument(
+        "--max-polygon-points", type=int, default=80,
+        help="Reject refined polygons whose simplified point count exceeds this threshold.",
+    )
+    parser.add_argument(
+        "--min-polygon-area", type=float, default=50.0,
+        help="Reject refined polygons smaller than this area.",
+    )
+    parser.add_argument(
+        "--max-area-change-ratio", type=float, default=1.5,
+        help="Reject refined polygons whose area grows above this ratio of the previous preview.",
+    )
+    parser.add_argument(
+        "--min-area-change-ratio", type=float, default=0.3,
+        help="Reject refined polygons whose area drops below this ratio of the previous preview.",
+    )
+    parser.add_argument(
+        "--reject-invalid-refine",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reject invalid refined polygons and keep the previous preview.",
+    )
     return parser.parse_args()
 
 
@@ -160,6 +232,14 @@ class TileReviewApplication:
             raise ValueError("--bbox-nearest-threshold must be non-negative.")
         if args.add_bbox_size <= 0:
             raise ValueError("--add-bbox-size must be positive.")
+        if args.negative_point_tolerance < 0:
+            raise ValueError("--negative-point-tolerance must be non-negative.")
+        if args.max_polygon_points < 3:
+            raise ValueError("--max-polygon-points must be at least 3.")
+        if args.min_polygon_area <= 0:
+            raise ValueError("--min-polygon-area must be greater than zero.")
+        if args.max_area_change_ratio <= 0 or args.min_area_change_ratio <= 0:
+            raise ValueError("--min/max-area-change-ratio must be greater than zero.")
         if not str(args.prompt_source_name).strip():
             raise ValueError("--prompt-source-name must not be empty.")
         self.args = args
@@ -203,6 +283,16 @@ class TileReviewApplication:
         except AttributeError:
             pass
         self.load_current_tile()
+
+    def refine_validation_config(self):
+        """Build one session validation config from current command-line arguments."""
+        return RefinePolygonValidationConfig(
+            max_polygon_points=int(self.args.max_polygon_points),
+            min_polygon_area=float(self.args.min_polygon_area),
+            max_area_change_ratio=float(self.args.max_area_change_ratio),
+            min_area_change_ratio=float(self.args.min_area_change_ratio),
+            reject_invalid_refine=bool(self.args.reject_invalid_refine),
+        )
 
     @property
     def tile(self):
@@ -322,6 +412,12 @@ class TileReviewApplication:
                 clicks[:, 0], clicks[:, 1], marker="+", s=90,
                 linewidths=2.0, color="cyan", clip_on=True,
             ))
+        if self.refine_session is not None and self.refine_session.negative_points:
+            clicks = self.np.asarray(self.refine_session.negative_points, dtype=float)
+            self._polygon_artists.append(self.ax.scatter(
+                clicks[:, 0], clicks[:, 1], marker="x", s=85,
+                linewidths=2.0, color="red", clip_on=True,
+            ))
         active = sum(
             polygon.status == "active" for polygon in visible_polygons
         )
@@ -334,21 +430,23 @@ class TileReviewApplication:
             f"{self.tile.tile_id}  |  {self.index + 1}/{len(self.manifest.tiles)}  |  "
             f"active={active} deleted={deleted}  |  source={source_label}{modified_label}"
         )
+        active_session = self.prompt_review_session or self.refine_session
         prompt_session_state = (
-            self.prompt_review_session.state.value
-            if self.prompt_review_session is not None else "idle"
+            active_session.state.value
+            if active_session is not None else "idle"
         )
         prompt_bbox_source = (
             self.prompt_review_session.bbox_source
-            if self.prompt_review_session is not None else "-"
+            if self.prompt_review_session is not None else
+            ("refine_session_bbox" if self.refine_session is not None else "-")
         )
         prompt_positive_count = (
-            len(self.prompt_review_session.positive_points)
-            if self.prompt_review_session is not None else 0
+            len(active_session.positive_points)
+            if active_session is not None else 0
         )
         prompt_negative_count = (
-            len(self.prompt_review_session.negative_points)
-            if self.prompt_review_session is not None else 0
+            len(active_session.negative_points)
+            if active_session is not None else 0
         )
         self._mode_artist = self.ax.text(
             0.01,
@@ -359,6 +457,9 @@ class TileReviewApplication:
                     f"Session: {prompt_session_state}",
                     f"BBox: {prompt_bbox_source}",
                     f"Points: +{prompt_positive_count} / -{prompt_negative_count}",
+                    "PointRefine: "
+                    f"{self.args.point_refine_mode if self.args.refine_by_points else 'off'}",
+                    f"NegFeature: {'on' if self.args.negative_feature_refine else 'off'}",
                 ]
             ),
             transform=self.ax.transAxes,
@@ -453,13 +554,15 @@ class TileReviewApplication:
                 return
             self.update_prompt_review(click, is_positive=(event.button == 1))
             return
-        if event.button != 1:
-            return
         if self.mode == "add":
+            if event.button != 1:
+                return
             self.add_polygon_at_click(click)
             return
         if self.mode == "refine":
-            self.refine_polygon_at_click(click)
+            self.refine_polygon_at_click(click, is_positive=(event.button == 1))
+            return
+        if event.button != 1:
             return
         polygon = select_polygon_at_point(
             self.result,
@@ -531,6 +634,7 @@ class TileReviewApplication:
             selected_auto_polygon_id=selected_auto_polygon_id,
             selected_auto_score=selected_auto_score,
             selected_auto_distance=selected_auto_distance,
+            validation_config=self.refine_validation_config(),
         )
         self.prompt_session_cache = PromptSessionCache()
         self.mode = "prompt"
@@ -550,8 +654,31 @@ class TileReviewApplication:
             min(max(int(round(click_point[1])), 0), image_height - 1),
         )
         bbox = self.prompt_review_session.bbox
+        if not is_positive and not self.prompt_review_session.can_accept_negative_point(
+            click,
+            tolerance=self.args.negative_point_tolerance,
+            prefer_polygon=True,
+            allow_outside_negative_points=self.args.allow_outside_negative_points,
+        ):
+            debug_info = dict(self.prompt_review_session.last_negative_point_debug)
+            if self.args.debug_prompt_points:
+                print("[debug_prompt_points] negative_point_validation =", {
+                    **debug_info,
+                    "image_shape": [int(image_height), int(image_width)],
+                })
+            print(
+                "Negative point outside current preview polygon, ignored. "
+                f"dist={debug_info.get('point_polygon_distance')}, "
+                f"tolerance={debug_info.get('tolerance')}"
+            )
+            return
+        if not is_positive and self.args.debug_prompt_points:
+            print("[debug_prompt_points] negative_point_validation =", {
+                **dict(self.prompt_review_session.last_negative_point_debug),
+                "image_shape": [int(image_height), int(image_width)],
+            })
 
-        def prompt_callback(positive_points, negative_points):
+        def prompt_callback(positive_points, negative_points, prompt_points=None, prompt_labels=None, click_order=None):
             if self.args.mock_prompt:
                 return run_mock_prompt_inference(positive_points, negative_points, bbox)
             return run_prompt_inference_on_tile(
@@ -563,6 +690,20 @@ class TileReviewApplication:
                 checkpoint_path=Path(self.args.checkpoint),
                 device=self.args.device,
                 session_cache=self.prompt_session_cache,
+                prompt_points=prompt_points,
+                prompt_labels=prompt_labels,
+                debug_prompt_points=self.args.debug_prompt_points,
+                refine_by_points=self.args.refine_by_points,
+                point_refine_mode=self.args.point_refine_mode,
+                negative_feature_refine=self.args.negative_feature_refine,
+                negative_similarity_thr=self.args.negative_similarity_thr,
+                negative_feature_patch_size=self.args.negative_feature_patch_size,
+                negative_protect_radius=self.args.negative_protect_radius,
+                negative_spatial_sigma=self.args.negative_spatial_sigma,
+                debug_refine_dir=Path(self.args.debug_refine_dir) if self.args.debug_refine_dir else None,
+                tile_id=self.tile.tile_id,
+                session_id=self.prompt_review_session.session_id,
+                click_order=click_order,
             )
 
         started_at = time.perf_counter()
@@ -582,6 +723,16 @@ class TileReviewApplication:
                 self._close_prompt_review_session()
             return
         point_type = "positive" if is_positive else "negative"
+        validation = dict(self.prompt_review_session.last_refine_validation)
+        if validation and not validation.get("accepted", True):
+            print(
+                f"[review] prompt {point_type} click rejected: "
+                f"reason={validation.get('reason')} "
+                f"area={validation.get('candidate_area')} "
+                f"ratio={validation.get('area_ratio')}"
+            )
+            self.draw_overlay()
+            return
         print(
             f"[review] prompt {point_type} click completed in "
             f"{time.perf_counter() - started_at:.3f}s: "
@@ -636,7 +787,10 @@ class TileReviewApplication:
         if not self.args.mock_prompt and (not self.args.config or not self.args.checkpoint):
             print("Refine mode requires --config and --checkpoint, or use --mock-prompt.")
             return
-        self.refine_session = RefineSession.start(polygon)
+        self.refine_session = RefineSession.start(
+            polygon,
+            validation_config=self.refine_validation_config(),
+        )
         self.prompt_session_cache = PromptSessionCache()
         self.mode = "refine"
         print(
@@ -645,8 +799,8 @@ class TileReviewApplication:
         )
         self.draw_overlay()
 
-    def refine_polygon_at_click(self, click_point):
-        """Add one positive point and preview a new polygon without committing it."""
+    def refine_polygon_at_click(self, click_point, is_positive=True):
+        """Add one positive or negative point and preview a new polygon."""
         if self.refine_session is None:
             raise RuntimeError("Refine mode has no active session.")
         image_height, image_width = self.image.shape[:2]
@@ -661,8 +815,31 @@ class TileReviewApplication:
             max(point[0] for point in original.points_tile),
             max(point[1] for point in original.points_tile),
         ]
+        if not is_positive and not self.refine_session.can_accept_negative_point(
+            click,
+            tolerance=self.args.negative_point_tolerance,
+            prefer_polygon=True,
+            allow_outside_negative_points=self.args.allow_outside_negative_points,
+        ):
+            debug_info = dict(self.refine_session.last_negative_point_debug)
+            if self.args.debug_prompt_points:
+                print("[debug_prompt_points] negative_point_validation =", {
+                    **debug_info,
+                    "image_shape": [int(image_height), int(image_width)],
+                })
+            print(
+                "Negative point outside current preview polygon, ignored. "
+                f"dist={debug_info.get('point_polygon_distance')}, "
+                f"tolerance={debug_info.get('tolerance')}"
+            )
+            return
+        if not is_positive and self.args.debug_prompt_points:
+            print("[debug_prompt_points] negative_point_validation =", {
+                **dict(self.refine_session.last_negative_point_debug),
+                "image_shape": [int(image_height), int(image_width)],
+            })
 
-        def prompt_callback(positive_points, negative_points):
+        def prompt_callback(positive_points, negative_points, prompt_points=None, prompt_labels=None, click_order=None):
             if self.args.mock_prompt:
                 return run_mock_prompt_inference(positive_points, negative_points, bbox)
             return run_prompt_inference_on_tile(
@@ -674,17 +851,46 @@ class TileReviewApplication:
                 checkpoint_path=Path(self.args.checkpoint),
                 device=self.args.device,
                 session_cache=self.prompt_session_cache,
+                prompt_points=prompt_points,
+                prompt_labels=prompt_labels,
+                debug_prompt_points=self.args.debug_prompt_points,
+                refine_by_points=self.args.refine_by_points,
+                point_refine_mode=self.args.point_refine_mode,
+                negative_feature_refine=self.args.negative_feature_refine,
+                negative_similarity_thr=self.args.negative_similarity_thr,
+                negative_feature_patch_size=self.args.negative_feature_patch_size,
+                negative_protect_radius=self.args.negative_protect_radius,
+                negative_spatial_sigma=self.args.negative_spatial_sigma,
+                debug_refine_dir=Path(self.args.debug_refine_dir) if self.args.debug_refine_dir else None,
+                tile_id=self.tile.tile_id,
+                session_id=self.refine_session.session_id,
+                click_order=click_order,
             )
 
         started_at = time.perf_counter()
         try:
-            polygon = self.refine_session.add_positive_point(click, prompt_callback)
+            polygon = (
+                self.refine_session.add_positive_point(click, prompt_callback)
+                if is_positive else
+                self.refine_session.add_negative_point(click, prompt_callback)
+            )
         except Exception as exc:
             print(f"Refine Prompt failed: {type(exc).__name__}: {exc}")
             return
+        validation = dict(self.refine_session.last_refine_validation)
+        if validation and not validation.get("accepted", True):
+            print(
+                f"[review] refine Prompt rejected: "
+                f"reason={validation.get('reason')} "
+                f"area={validation.get('candidate_area')} "
+                f"ratio={validation.get('area_ratio')}"
+            )
+            self.draw_overlay()
+            return
         print(
             f"[review] refine Prompt completed in {time.perf_counter() - started_at:.3f}s: "
-            f"points={len(self.refine_session.positive_points)}, score={polygon.score}"
+            f"+{len(self.refine_session.positive_points)} "
+            f"-{len(self.refine_session.negative_points)} score={polygon.score}"
         )
         self.draw_overlay()
 
@@ -805,7 +1011,7 @@ class TileReviewApplication:
                 self._closing = True
                 self.plt.close(self.fig)
             else:
-                print("Refine mode is running; use left-click, Enter, Esc, or H.")
+                print("Refine mode is running; use left/right click, Enter, Esc, or H.")
             return
         if self.prompt_review_session is not None:
             if key in ("enter", "return"):
