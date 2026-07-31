@@ -30,7 +30,7 @@ class AutoApiContractTest(unittest.TestCase):
         checkpoint_path = self.root / "auto.pth"
         config_path.write_text("task_name='test'", encoding="utf-8")
         checkpoint_path.write_bytes(b"mock-checkpoint")
-        service = AutoInferenceService(
+        self.service = AutoInferenceService(
             AutoServiceConfig(
                 model_config=config_path,
                 checkpoint=checkpoint_path,
@@ -42,7 +42,9 @@ class AutoApiContractTest(unittest.TestCase):
             infer_runner=self._fake_runner,
             cuda_probe=lambda: True,
         )
-        self.client = TestClient(create_app(service))
+        # Explicitly disable authentication for the existing local contract
+        # tests, independent of the developer machine's environment.
+        self.client = TestClient(create_app(self.service, api_key=""))
 
     def tearDown(self):
         self.client.close()
@@ -121,6 +123,28 @@ class AutoApiContractTest(unittest.TestCase):
         self.assertEqual(
             response.json()["error"]["code"], "request_validation_error"
         )
+
+    def test_configured_api_key_protects_inference_but_not_health(self):
+        from fastapi.testclient import TestClient
+
+        from api.app import create_app
+
+        with TestClient(create_app(self.service, api_key="test-secret")) as client:
+            health = client.get("/health")
+            unauthorized = client.post(
+                "/v1/auto/infer",
+                files={"image": ("image001.tiff", self._image_bytes(), "image/tiff")},
+            )
+            authorized = client.post(
+                "/v1/auto/infer",
+                headers={"X-API-Key": "test-secret"},
+                files={"image": ("image001.tiff", self._image_bytes(), "image/tiff")},
+            )
+
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(unauthorized.json()["error"]["code"], "unauthorized")
+        self.assertEqual(authorized.status_code, 200, authorized.text)
 
 
 if __name__ == "__main__":

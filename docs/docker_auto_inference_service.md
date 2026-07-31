@@ -170,6 +170,7 @@ Important error codes include:
 - `invalid_image`
 - `invalid_score_threshold`
 - `request_validation_error`
+- `unauthorized`
 - `config_not_found`
 - `checkpoint_not_found`
 - `cuda_unavailable`
@@ -192,10 +193,188 @@ The container supports the following environment variables:
 | `SAMPOLY_NUM_WORKERS` | `1` |
 | `SAMPOLY_DEFAULT_SCORE_THRESHOLD` | `0.1` |
 | `SAMPOLY_MAX_UPLOAD_MB` | `100` |
+| `SAMPOLY_API_KEY` | empty (authentication disabled) |
 
 The service writes each upload and its intermediate artifacts into a unique
 temporary runtime directory. The directory is removed after the response is
 created, including failed requests.
+
+When `SAMPOLY_API_KEY` is non-empty, `/v1/auto/infer` requires the exact value
+in the `X-API-Key` header. `/health` intentionally remains unauthenticated so
+Docker and infrastructure health checks can determine readiness. Do not expose
+an unauthenticated service to an untrusted network.
+
+## Build once and deploy to another machine
+
+Containerization has three separate deliverables:
+
+1. `docker/Dockerfile` is the reproducible image recipe.
+2. `sampoly-auto-api:cu117` is the built image containing SAMPoly, CUDA runtime,
+   Python dependencies, configuration, and the HTTP service.
+3. `auto_whumix.pth` is deployed separately and mounted read-only. It is not
+   copied into the image because of its size and possible distribution terms.
+
+The machine that builds the image needs access to Docker Hub, PyTorch,
+OpenMMLab, Python package repositories, and the system package repositories.
+After an image archive has been produced, an offline target host does not need
+those package repositories.
+
+### Export on the build machine
+
+Build and export on Windows:
+
+```powershell
+docker compose -f docker/compose.yaml build --progress=plain
+powershell -ExecutionPolicy Bypass -File docker/export-image.ps1 `
+  -Image sampoly-auto-api:cu117 `
+  -Output sampoly-auto-api-cu117.tar
+```
+
+Build and export on Linux:
+
+```bash
+docker compose -f docker/compose.yaml build --progress=plain
+sh docker/export-image.sh sampoly-auto-api:cu117 sampoly-auto-api-cu117.tar
+```
+
+Copy the following deployment bundle to the target GPU server:
+
+```text
+sampoly-deploy/
+  sampoly-auto-api-cu117.tar
+  docker/
+    compose.deploy.yaml
+    .env.example
+    deploy-image.ps1
+    deploy-image.sh
+    verify-remote.ps1
+    verify-remote.sh
+  checkpoints/
+    auto_whumix.pth
+```
+
+Before distributing a checkpoint, verify that its license permits transfer to
+the target machine.
+
+### Configure the target host
+
+The target host requires Docker with the Compose plugin, a compatible NVIDIA
+driver, and NVIDIA container GPU access. It does not require a local SAMPoly
+Python environment. First verify GPU access:
+
+```shell
+docker run --rm --gpus all nvidia/cuda:11.7.1-base-ubuntu22.04 nvidia-smi
+```
+
+Copy `docker/.env.example` to `docker/.env`, then set at least:
+
+```dotenv
+SAMPOLY_IMAGE=sampoly-auto-api:cu117
+SAMPOLY_BIND_HOST=0.0.0.0
+SAMPOLY_API_PORT=8000
+SAMPOLY_CHECKPOINT_DIR=../checkpoints
+SAMPOLY_CHECKPOINT_FILE=auto_whumix.pth
+SAMPOLY_API_KEY=replace-with-a-long-random-secret
+```
+
+All paths supplied to Compose must be valid on the target host. Use an absolute
+checkpoint directory if the deployment files can be launched from different
+working directories.
+
+### Import and start on Windows
+
+```powershell
+Copy-Item docker/.env.example docker/.env
+# Edit docker/.env before starting the service.
+powershell -ExecutionPolicy Bypass -File docker/deploy-image.ps1 `
+  -Archive sampoly-auto-api-cu117.tar `
+  -EnvFile docker/.env
+```
+
+### Import and start on Linux
+
+```bash
+cp docker/.env.example docker/.env
+# Edit docker/.env before starting the service.
+sh docker/deploy-image.sh sampoly-auto-api-cu117.tar docker/.env
+```
+
+The deployment Compose file uses `image:` without `build:`. Consequently, the
+target machine uses the imported image and never attempts to rebuild SAMPoly.
+
+### Deploy through a trusted registry instead
+
+An organization with a private registry can replace archive transfer:
+
+```shell
+docker tag sampoly-auto-api:cu117 registry.example.com/sampoly-auto-api:1.0.0
+docker push registry.example.com/sampoly-auto-api:1.0.0
+```
+
+Set `SAMPOLY_IMAGE=registry.example.com/sampoly-auto-api:1.0.0` in the target
+`.env`, run `docker pull`, and start `compose.deploy.yaml`. Registry credentials
+and TLS configuration are infrastructure responsibilities and must not be
+stored in the repository.
+
+## Remote client verification
+
+Assume the GPU server address is `192.168.1.100` and TCP port `8000` is allowed
+by its host firewall. From a different Windows machine:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File docker/verify-remote.ps1 `
+  -BaseUrl http://192.168.1.100:8000 `
+  -ApiKey replace-with-a-long-random-secret `
+  -Image D:\data\WHU\image001.tiff `
+  -Output auto-response.json
+```
+
+The equivalent direct HTTP request is:
+
+```powershell
+curl.exe -X POST "http://192.168.1.100:8000/v1/auto/infer" `
+  -H "X-API-Key: replace-with-a-long-random-secret" `
+  -F "image=@D:\data\WHU\image001.tiff" `
+  -F "score_threshold=0.1" `
+  -o auto-response.json
+```
+
+From Linux:
+
+```bash
+sh docker/verify-remote.sh \
+  http://192.168.1.100:8000 \
+  replace-with-a-long-random-secret \
+  /data/WHU/image001.tiff \
+  auto-response.json
+```
+
+The client only needs an HTTP client. It does not need CUDA, Python, SAMPoly,
+or the checkpoint. Returned polygon points use original image pixel
+coordinates, so a desktop GUI can draw them directly over the uploaded image.
+
+## Network and security boundary
+
+`compose.yaml` remains restricted to `127.0.0.1` for local development.
+`compose.deploy.yaml` defaults to `0.0.0.0` for cross-machine access. Opening a
+host firewall port is an explicit deployment action; Docker configuration does
+not replace Windows Defender Firewall, Linux firewall, router, or cloud security
+group rules.
+
+For a trusted LAN, use a strong API key and restrict port `8000` to the client
+subnet. For Internet access, place the service behind an HTTPS reverse proxy or
+API gateway with authentication, request-size limits, timeouts, and audit
+logging. Do not publish the raw unauthenticated Uvicorn endpoint to the public
+Internet.
+
+## Portability limits
+
+The provided image targets Linux `x86_64`, CUDA 11.7, PyTorch 2.0, and NVIDIA
+GPU execution. It can run through Docker Desktop/WSL2 on Windows or Docker
+Engine on Linux when the host driver supports the container CUDA runtime.
+Running the same artifact on ARM hardware, a non-NVIDIA accelerator, or a host
+without compatible GPU container support is outside the validated deployment
+target. Client machines have no GPU requirement.
 
 ## Stop and inspect
 

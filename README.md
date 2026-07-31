@@ -95,6 +95,13 @@ See [docs/docker_auto_inference_service.md](docs/docker_auto_inference_service.m
 for Windows Docker Desktop prerequisites, response fields, configuration,
 testing, and troubleshooting.
 
+For deployment on a separate GPU server, build the image once, export it with
+`docker/export-image.ps1` or `docker/export-image.sh`, and start it on the
+target host with `docker/compose.deploy.yaml`. The deployment configuration
+listens on a configurable network interface and supports an optional
+`X-API-Key` for `/v1/auto/infer`; see the same guide for Windows/Linux offline
+transfer and remote client examples.
+
 To draw only the Auto polygons over one source image in a single canvas, use
 the standalone CLI below. It saves a PNG by default and opens a Matplotlib
 window when `--show` is supplied. This utility reads the existing

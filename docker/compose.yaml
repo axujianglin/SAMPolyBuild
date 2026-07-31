@@ -17,6 +17,8 @@ services:
       SAMPOLY_NUM_WORKERS: "1"
       SAMPOLY_DEFAULT_SCORE_THRESHOLD: "0.1"
       SAMPOLY_MAX_UPLOAD_MB: "100"
+      # Empty preserves the original host-only development behavior.
+      SAMPOLY_API_KEY: ""
     volumes:
       - ../checkpoints:/app/checkpoints:ro
       - sampoly-runtime:/app/runtime

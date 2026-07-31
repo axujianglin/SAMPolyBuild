@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import tempfile
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -133,9 +134,15 @@ def _error_response(error: AutoServiceError) -> JSONResponse:
     )
 
 
-def create_app(service: AutoInferenceService | None = None) -> FastAPI:
+def create_app(
+    service: AutoInferenceService | None = None,
+    api_key: str | None = None,
+) -> FastAPI:
     """Create the API with an injectable service for model-free tests."""
     inference_service = service or AutoInferenceService(service_config_from_env())
+    configured_api_key = (
+        os.getenv("SAMPOLY_API_KEY", "") if api_key is None else str(api_key)
+    ).strip()
     application = FastAPI(
         title="SAMPoly Auto Inference Service",
         version="1.0.0",
@@ -167,6 +174,7 @@ def create_app(service: AutoInferenceService | None = None) -> FastAPI:
         response_model=AutoInferenceResponse,
         responses={
             400: {"model": ErrorResponse},
+            401: {"model": ErrorResponse},
             413: {"model": ErrorResponse},
             422: {"model": ErrorResponse},
             500: {"model": ErrorResponse},
@@ -176,11 +184,20 @@ def create_app(service: AutoInferenceService | None = None) -> FastAPI:
     async def infer_auto(
         image: UploadFile = File(...),
         score_threshold: float | None = Form(default=None),
+        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     ):
         """Run the unchanged Auto pipeline on one uploaded image."""
         request_id = uuid.uuid4().hex
         temporary_root: Path | None = None
         try:
+            if configured_api_key and not secrets.compare_digest(
+                str(x_api_key or ""), configured_api_key
+            ):
+                raise AutoServiceError(
+                    "unauthorized",
+                    "A valid X-API-Key header is required.",
+                    401,
+                )
             safe_name, _ = _safe_upload_name(image.filename)
             inference_service.config.runtime_root.mkdir(parents=True, exist_ok=True)
             temporary_root = Path(
