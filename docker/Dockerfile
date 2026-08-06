@@ -19,6 +19,7 @@ RUN apt-get update \
         build-essential \
         ca-certificates \
         git \
+        libgl1 \
         libglib2.0-0 \
         python3.10 \
         python3.10-dev \
@@ -55,6 +56,10 @@ RUN python3.10 -m pip install Cython==0.29.36 \
     && python3.10 -m pip install \
         --no-build-isolation \
         /tmp/pycocotools/PythonAPI
+
+# Fail the image build before deployment if native graphics libraries or the
+# pinned legacy Lightning Cloud API become incompatible with the runtime.
+RUN python3.10 -c "import cv2; import lightning; import mmcv; import pycocotools._mask; from lightning_cloud.openapi import AppinstancesIdBody; print('SAMPoly Docker runtime imports OK')"
 
 COPY . /app
 RUN mkdir -p /app/runtime /app/checkpoints

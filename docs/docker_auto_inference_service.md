@@ -77,6 +77,12 @@ docker run --rm --entrypoint python3.10 sampoly-auto-api:cu117 -m pip check
 
 The expected output is `No broken requirements found.`
 
+Lightning `2.0.1` declares only `lightning-cloud>=0.5.31`, although it imports
+the legacy OpenAPI model `AppinstancesIdBody`. Newer lightning-cloud releases
+removed that model, so the Docker supplemental requirements pin
+`lightning-cloud==0.5.31`. This preserves the existing Lightning runner rather
+than upgrading the inference framework.
+
 The repository vendors an older pycocotools source tree. Its `setup.py` imports
 NumPy while preparing the wheel and compiles `PythonAPI/pycocotools/_mask.pyx`
 together with `common/maskApi.c`, but it does not declare NumPy and Cython as
@@ -89,6 +95,12 @@ already installed before that step. Verify the compiled extension after build:
 docker run --rm --entrypoint python3.10 sampoly-auto-api:cu117 \
   -c "import pycocotools._mask; print('pycocotools native extension OK')"
 ```
+
+OpenCV/MMCV may load `libGL.so.1` even when no GUI window is shown. The image
+therefore installs Ubuntu's `libgl1` package in addition to `libglib2.0-0`.
+The Dockerfile performs an import smoke test for OpenCV, MMCV, Lightning,
+lightning-cloud, and the native pycocotools extension, so these compatibility
+errors fail during image construction instead of the first inference request.
 
 The API listens inside the container on `0.0.0.0:8000`, but Compose publishes
 it only on the Windows loopback address:
