@@ -64,6 +64,19 @@ docker compose -f docker/compose.yaml up -d
 docker compose -f docker/compose.yaml logs -f sampoly-auto-api
 ```
 
+The API dependencies deliberately use FastAPI `0.88.0`, Uvicorn `0.20.0`, and
+HTTPX `0.23.3`. The existing SAMPoly runtime pins `lightning==2.0.1`, whose
+package metadata requires `fastapi<0.89.0`; using a newer FastAPI in the same
+Python environment makes pip fail with `ResolutionImpossible`. Keeping the API
+adapter on the compatible release line avoids changing the model and inference
+runtime. After a successful build, verify dependency consistency with:
+
+```shell
+docker run --rm --entrypoint python3.10 sampoly-auto-api:cu117 -m pip check
+```
+
+The expected output is `No broken requirements found.`
+
 The API listens inside the container on `0.0.0.0:8000`, but Compose publishes
 it only on the Windows loopback address:
 
