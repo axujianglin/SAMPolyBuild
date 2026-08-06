@@ -77,6 +77,19 @@ docker run --rm --entrypoint python3.10 sampoly-auto-api:cu117 -m pip check
 
 The expected output is `No broken requirements found.`
 
+The repository vendors an older pycocotools source tree. Its `setup.py` imports
+NumPy while preparing the wheel and compiles `PythonAPI/pycocotools/_mask.pyx`
+together with `common/maskApi.c`, but it does not declare NumPy and Cython as
+modern isolated build requirements. The Dockerfile therefore copies the whole
+vendored tree, installs Cython `0.29.36`, and uses `--no-build-isolation` only
+for this package. NumPy `1.24.3`, setuptools, wheel, and the native compiler are
+already installed before that step. Verify the compiled extension after build:
+
+```shell
+docker run --rm --entrypoint python3.10 sampoly-auto-api:cu117 \
+  -c "import pycocotools._mask; print('pycocotools native extension OK')"
+```
+
 The API listens inside the container on `0.0.0.0:8000`, but Compose publishes
 it only on the Windows loopback address:
 

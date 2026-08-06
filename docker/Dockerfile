@@ -44,8 +44,17 @@ RUN python3.10 -m pip install --upgrade pip setuptools wheel \
         mmcv==2.0.0 \
         -f https://download.openmmlab.com/mmcv/dist/cu117/torch2.0/index.html
 
-COPY pycocotools/PythonAPI /tmp/pycocotools
-RUN python3.10 -m pip install /tmp/pycocotools
+# Preserve the vendored source layout because PythonAPI/setup.py compiles the
+# sibling common/maskApi.c source file into the native _mask extension.
+COPY pycocotools /tmp/pycocotools
+
+# The legacy setup.py imports NumPy while preparing the wheel but does not
+# declare NumPy as a build dependency. Build against the project NumPy already
+# installed above and provide Cython explicitly for the _mask.pyx source.
+RUN python3.10 -m pip install Cython==0.29.36 \
+    && python3.10 -m pip install \
+        --no-build-isolation \
+        /tmp/pycocotools/PythonAPI
 
 COPY . /app
 RUN mkdir -p /app/runtime /app/checkpoints
