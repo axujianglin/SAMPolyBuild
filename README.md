@@ -95,6 +95,10 @@ See [docs/docker_auto_inference_service.md](docs/docker_auto_inference_service.m
 for Windows Docker Desktop prerequisites, response fields, configuration,
 testing, and troubleshooting.
 
+Linux 环境下从 GPU 前置检查、Docker 镜像构建、SHA256 完整性校验、离线传输、
+目标服务器部署、远程推理到故障排查的完整中文操作手册，请参阅
+[docs/linux_neural_network_docker_deployment.md](docs/linux_neural_network_docker_deployment.md)。
+
 For deployment on a separate GPU server, build the image once, export it with
 `docker/export-image.ps1` or `docker/export-image.sh`, and start it on the
 target host with `docker/compose.deploy.yaml`. The deployment configuration
