@@ -42,3 +42,6 @@ _darcs
 /.agents/
 /.codegraph/
 
+# Local interactive API secret file
+/docker/interactive.env
+

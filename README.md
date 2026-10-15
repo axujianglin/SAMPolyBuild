@@ -533,6 +533,12 @@ new prompt instance with a square bbox controlled by `--new_instance_bbox_size`.
 Press `d` to mark the selected instance as deleted, or `c` to clear the selection.
 The output retains both active and deleted instances in global coordinates.
 
+## SHORTER 多轮交互优化服务
+
+仓库提供与 SHORTER 协议 `2.0` 兼容的独立 HTTP 服务，支持影像 session、正负点累计提示、上一轮 mask logits 和显式资源释放。Linux、Docker、curl 和 SHORTER 配置说明见：
+
+[多轮交互优化 HTTP 服务部署与联调手册](docs/interactive_refinement_service.md)
+
 ## Acknowledgement
 This project is developed based on the [Segment Anything Model (SAM)](https://github.com/facebookresearch/segment-anything)
  and [RSPrompter](https://github.com/KyanChen/RSPrompter) project. We thank the authors for their contributions.
