@@ -68,6 +68,44 @@ Show the predicted polygons and masks on the images (change the img_dir, dt_pth 
 python utils/show_pred.py
 ```
 
+### Docker Auto inference API
+
+The existing Auto inference can be exposed to a Windows desktop client through
+a GPU-enabled Docker service. The first API stage provides `GET /health` and
+`POST /v1/auto/infer`; it does not modify the Auto model or Prompt workflow.
+
+Place `auto_whumix.pth` under `checkpoints/`, then build and start the service:
+
+```shell
+docker compose -f docker/compose.yaml build
+docker compose -f docker/compose.yaml up -d
+curl http://127.0.0.1:8000/health
+```
+
+Submit one image:
+
+```shell
+curl -X POST http://127.0.0.1:8000/v1/auto/infer \
+  -F "image=@dataset/WHU-data/image001.tiff" \
+  -F "score_threshold=0.1" \
+  -o auto_response.json
+```
+
+See [docs/docker_auto_inference_service.md](docs/docker_auto_inference_service.md)
+for Windows Docker Desktop prerequisites, response fields, configuration,
+testing, and troubleshooting.
+
+Linux 环境下从 GPU 前置检查、Docker 镜像构建、SHA256 完整性校验、离线传输、
+目标服务器部署、远程推理到故障排查的完整中文操作手册，请参阅
+[docs/linux_neural_network_docker_deployment.md](docs/linux_neural_network_docker_deployment.md)。
+
+For deployment on a separate GPU server, build the image once, export it with
+`docker/export-image.ps1` or `docker/export-image.sh`, and start it on the
+target host with `docker/compose.deploy.yaml`. The deployment configuration
+listens on a configurable network interface and supports an optional
+`X-API-Key` for `/v1/auto/infer`; see the same guide for Windows/Linux offline
+transfer and remote client examples.
+
 To draw only the Auto polygons over one source image in a single canvas, use
 the standalone CLI below. It saves a PNG by default and opens a Matplotlib
 window when `--show` is supplied. This utility reads the existing

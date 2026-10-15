@@ -1,0 +1,11 @@
+# Keep the API stack compatible with the project's lightning==2.0.1, which
+# declares fastapi<0.89.0. These versions also keep Starlette TestClient and
+# HTTPX on a mutually compatible release line.
+fastapi==0.88.0
+uvicorn[standard]==0.20.0
+python-multipart==0.0.20
+httpx==0.23.3
+
+# lightning==2.0.1 only declares lightning-cloud>=0.5.31. Newer Cloud API
+# releases removed AppinstancesIdBody, which Lightning 2.0.1 imports eagerly.
+lightning-cloud==0.5.31

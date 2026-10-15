@@ -1,0 +1,48 @@
+services:
+  sampoly-auto-api:
+    # Deployment hosts consume a prebuilt image. They do not need the source
+    # tree or a network connection to Python/CUDA package repositories.
+    image: ${SAMPOLY_IMAGE:-sampoly-auto-api:cu117}
+    restart: unless-stopped
+    ports:
+      - "${SAMPOLY_BIND_HOST:-0.0.0.0}:${SAMPOLY_API_PORT:-8000}:8000"
+    environment:
+      SAMPOLY_AUTO_CONFIG: /app/configs/auto_whumix.py
+      SAMPOLY_AUTO_CHECKPOINT: /app/checkpoints/${SAMPOLY_CHECKPOINT_FILE:-auto_whumix.pth}
+      SAMPOLY_RUNTIME_ROOT: /app/runtime
+      SAMPOLY_DEVICE: ${SAMPOLY_DEVICE:-cuda}
+      SAMPOLY_GPU: ${SAMPOLY_GPU:-0}
+      SAMPOLY_BATCH_SIZE: ${SAMPOLY_BATCH_SIZE:-1}
+      SAMPOLY_NUM_WORKERS: ${SAMPOLY_NUM_WORKERS:-1}
+      SAMPOLY_DEFAULT_SCORE_THRESHOLD: ${SAMPOLY_DEFAULT_SCORE_THRESHOLD:-0.1}
+      SAMPOLY_MAX_UPLOAD_MB: ${SAMPOLY_MAX_UPLOAD_MB:-100}
+      # Leave empty only on a trusted isolated network. When configured,
+      # clients must send the same value in the X-API-Key request header.
+      SAMPOLY_API_KEY: ${SAMPOLY_API_KEY:-}
+    volumes:
+      - ${SAMPOLY_CHECKPOINT_DIR:-../checkpoints}:/app/checkpoints:ro
+      - sampoly-runtime:/app/runtime
+    shm_size: ${SAMPOLY_SHM_SIZE:-4gb}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD
+        - python3.10
+        - -c
+        - >-
+          import json,sys,urllib.request;
+          data=json.load(urllib.request.urlopen('http://127.0.0.1:8000/health'));
+          sys.exit(0 if data.get('status') == 'ready' else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  sampoly-runtime:
