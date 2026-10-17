@@ -19,7 +19,7 @@ class FakePredictor:
     def predict(self, **kwargs):
         self.calls.append(kwargs)
         mask = np.zeros((1, 16, 16), dtype=np.uint8)
-        mask[3:11, 3:11] = 1
+        mask[0, 3:11, 3:11] = 1
         logits = np.ones((1, 4, 4), dtype=np.float32)
         return mask, np.asarray([0.83], dtype=np.float32), logits, None
 
