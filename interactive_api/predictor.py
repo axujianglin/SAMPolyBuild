@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from tools.point_refine_utils import extract_main_polygon_from_mask
+from skimage.measure import label as connected_component_label
 from tools.prompt_inference_utils import build_prompt_predictor, load_prompt_settings
 
 from .config import InteractiveServiceConfig
@@ -203,8 +204,12 @@ class InteractivePredictorAdapter:
 
         candidates: list[tuple[tuple[float, ...], int, np.ndarray, str]] = []
         for mask_index, raw_mask in enumerate(masks):
-            binary = (raw_mask > 0).astype(np.uint8)
-            component_count, labels = cv2.connectedComponents(binary, connectivity=8)
+            binary = np.ascontiguousarray(
+                (raw_mask > 0).astype(np.uint8)
+            )
+            labels = connected_component_label(binary, connectivity=2)
+            component_count = int(labels.max()) + 1
+
             for component_id in range(1, component_count):
                 component = (labels == component_id).astype(np.uint8)
                 area = int(component.sum())
