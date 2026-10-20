@@ -1,0 +1,6 @@
+# Linux deployment assets must keep LF endings when edited on Windows.
+*.sh text eol=lf
+*.service text eol=lf
+*.service.in text eol=lf
+deploy/systemd/*.target text eol=lf
+deploy/systemd/*.env.example text eol=lf

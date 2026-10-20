@@ -45,3 +45,6 @@ _darcs
 # Local interactive API secret file
 /docker/interactive.env
 
+# Local systemd deployment configuration with API keys and host paths
+/deploy/systemd/sampoly.env
+

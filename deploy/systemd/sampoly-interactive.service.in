@@ -1,0 +1,21 @@
+[Unit]
+Description=SAMPoly Interactive Refinement HTTP Service
+Wants=network-online.target
+After=network-online.target
+PartOf=sampoly.target
+
+[Service]
+Type=simple
+User=@RUN_USER@
+Group=@RUN_GROUP@
+EnvironmentFile=/etc/sampoly/sampoly.env
+ExecStart=/usr/local/libexec/sampoly-service-launcher interactive
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=300s
+TimeoutStopSec=120s
+KillSignal=SIGINT
+UMask=0077
+
+[Install]
+WantedBy=sampoly.target

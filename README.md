@@ -539,6 +539,10 @@ The output retains both active and deleted instances in global coordinates.
 
 [多轮交互优化 HTTP 服务部署与联调手册](docs/interactive_refinement_service.md)
 
+Linux 原生环境可使用 systemd 将 Auto 与交互优化服务注册为网络就绪后的开机自启后台服务，集中管理模型路径、端口和 API Key：
+
+[Linux systemd 开机自启与后台服务手册](docs/linux_systemd_autostart.md)
+
 ## Acknowledgement
 This project is developed based on the [Segment Anything Model (SAM)](https://github.com/facebookresearch/segment-anything)
  and [RSPrompter](https://github.com/KyanChen/RSPrompter) project. We thank the authors for their contributions.

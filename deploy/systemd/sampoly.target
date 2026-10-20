@@ -1,0 +1,7 @@
+[Unit]
+Description=SAMPoly HTTP Services
+Wants=sampoly-auto.service sampoly-interactive.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target
