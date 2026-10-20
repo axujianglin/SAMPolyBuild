@@ -1,0 +1,48 @@
+services:
+  sampoly-interactive-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: sampoly-auto-api:cu117
+    command:
+      - python3.10
+      - -m
+      - interactive_api.main
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    env_file:
+      - interactive.env
+    environment:
+      SAMPOLY_CONFIG: /app/configs/prompt_instance_spacenet.json
+      SAMPOLY_CHECKPOINT: /app/checkpoints/prompt_interactive.pth
+      SAMPOLY_DEVICE: cuda
+      SAMPOLY_HOST: 0.0.0.0
+      SAMPOLY_PORT: "8010"
+      SAMPOLY_MAX_UPLOAD_MB: "100"
+      SAMPOLY_MAX_CONCURRENCY: "1"
+      SAMPOLY_SESSION_TTL_SECONDS: "1800"
+      SAMPOLY_MAX_SESSIONS: "4"
+    volumes:
+      - ../checkpoints:/app/checkpoints:ro
+    shm_size: "4gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD
+        - python3.10
+        - -c
+        - >-
+          import json,sys,urllib.request;
+          data=json.load(urllib.request.urlopen('http://127.0.0.1:8010/health'));
+          sys.exit(0 if data.get('status') == 'ready' else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

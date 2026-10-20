@@ -64,6 +64,6 @@ RUN python3.10 -c "import cv2; import lightning; import mmcv; import pycocotools
 COPY . /app
 RUN mkdir -p /app/runtime /app/checkpoints
 
-EXPOSE 8000
+EXPOSE 8000 8010
 
 CMD ["python3.10", "-m", "uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
