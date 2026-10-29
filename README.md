@@ -539,6 +539,8 @@ The output retains both active and deleted instances in global coordinates.
 
 [多轮交互优化 HTTP 服务部署与联调手册](docs/interactive_refinement_service.md)
 
+交互 HTTP 服务在首次 Refine 指定 BBox 时，按本地交互窗口的裁剪方式计算并缓存建筑邻域 embedding；多轮交互复用缓存，并将输出轮廓映射回原图坐标。创建 Session 只上传一次影像，不对整图进行低分辨率编码。
+
 ## Acknowledgement
 This project is developed based on the [Segment Anything Model (SAM)](https://github.com/facebookresearch/segment-anything)
  and [RSPrompter](https://github.com/KyanChen/RSPrompter) project. We thank the authors for their contributions.

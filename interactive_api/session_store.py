@@ -39,6 +39,9 @@ class SessionEntry:
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def release(self) -> None:
+        if hasattr(self.prepared_image, "crop_cache"):
+            self.prepared_image.crop_cache.clear()
+            self.prepared_image.image_rgb = None
         self.prepared_image = None
         for state in self.interaction_states.values():
             state.mask_logits = None

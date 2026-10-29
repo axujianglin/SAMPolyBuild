@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
 import numpy as np
 
-from tools.point_refine_utils import extract_main_polygon_from_mask
 from skimage.measure import label as connected_component_label
-from tools.prompt_inference_utils import build_prompt_predictor, load_prompt_settings
+from tools.prompt_inference_utils import (
+    build_prompt_predictor,
+    load_prompt_settings,
+    polygon_from_prediction_mask,
+)
 
 from .config import InteractiveServiceConfig
 from .errors import InteractiveAPIError
@@ -19,11 +22,13 @@ from .errors import InteractiveAPIError
 
 @dataclass
 class PreparedImage:
-    """CPU-resident image features and transform metadata for one session."""
+    """Session image and per-BBox crop embeddings; never share GPU model state."""
 
     embedding: Any
     original_size: tuple[int, int]
     input_size: tuple[int, int]
+    image_rgb: np.ndarray | None = None
+    crop_cache: dict[tuple[float, float, float, float], tuple[Any, tuple[int, int], tuple[int, int], tuple[int, int, int, int]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -78,20 +83,40 @@ class InteractivePredictorAdapter:
             raise InteractiveAPIError(
                 "model_unavailable", "The interactive model is unavailable.", 503
             )
-        self._enter_capacity()
-        try:
-            with self._model_lock:
-                self.predictor.set_image(image_rgb, image_format="RGB")
-                embedding = self.predictor.get_image_embedding().detach().to("cpu").clone()
-                prepared = PreparedImage(
-                    embedding=embedding,
-                    original_size=tuple(self.predictor.original_size),
-                    input_size=tuple(self.predictor.input_size),
-                )
-                self.predictor.reset_image()
-                return prepared
-        finally:
-            self._capacity.release()
+        height, width = image_rgb.shape[:2]
+        return PreparedImage(None, (height, width), (height, width), image_rgb.copy())
+
+    @staticmethod
+    def _crop_bounds(bbox: tuple[float, float, float, float], height: int, width: int) -> tuple[int, int, int, int]:
+        """Match interactive_prompt.get_prompt's 7.5% BBox crop and integer truncation."""
+        x1, y1, x2, y2 = bbox
+        box_width, box_height = x2 - x1, y2 - y1
+        left = int(max(0, x1 - box_width * 0.075))
+        top = int(max(0, y1 - box_height * 0.075))
+        right = min(width, max(int(np.ceil(x2)), int(left + box_width * 1.15)))
+        bottom = min(height, max(int(np.ceil(y2)), int(top + box_height * 1.15)))
+        if right <= left or bottom <= top:
+            raise InteractiveAPIError("invalid_bbox", "BBox cannot form a valid image crop.", 400)
+        return left, top, right, bottom
+
+    def _prepare_crop(self, prepared: PreparedImage, bbox: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+        height, width = prepared.original_size
+        bounds = self._crop_bounds(bbox, height, width)
+        if bbox not in prepared.crop_cache:
+            if prepared.image_rgb is None:
+                raise InteractiveAPIError("model_unavailable", "The session image is unavailable.", 503)
+            left, top, right, bottom = bounds
+            self.predictor.set_image_resize(prepared.image_rgb[top:bottom, left:right], image_format="RGB")
+            embedding = self.predictor.get_image_embedding().detach().to("cpu").clone()
+            prepared.crop_cache[bbox] = (
+                embedding, tuple(self.predictor.original_size),
+                tuple(self.predictor.input_size), bounds,
+            )
+            # Bound CPU feature memory when a session refines many buildings.
+            while len(prepared.crop_cache) > 16:
+                prepared.crop_cache.pop(next(iter(prepared.crop_cache)))
+            self.predictor.reset_image()
+        return bounds
 
     def predict(
         self,
@@ -110,12 +135,20 @@ class InteractivePredictorAdapter:
         self._enter_capacity()
         try:
             with self._model_lock:
-                self._restore_prepared_image(prepared_image)
+                bounds = self._prepare_crop(prepared_image, bbox)
+                embedding, crop_size, input_size, _ = prepared_image.crop_cache[bbox]
+                self._restore_prepared_image(PreparedImage(embedding, crop_size, input_size))
+                left, top, right, bottom = bounds
+                local_bbox = np.asarray(bbox, dtype=np.float32) - np.asarray([left, top, left, top], dtype=np.float32)
                 point_coords = np.asarray(
                     positive_points + negative_points, dtype=np.float32
                 )
+                point_coords -= np.asarray([left, top], dtype=np.float32)
+                center = np.asarray([[(local_bbox[0] + local_bbox[2]) / 2,
+                                      (local_bbox[1] + local_bbox[3]) / 2]], dtype=np.float32)
+                point_coords = np.concatenate((center, point_coords), axis=0)
                 point_labels = np.asarray(
-                    [1] * len(positive_points) + [0] * len(negative_points),
+                    [1] + [1] * len(positive_points) + [0] * len(negative_points),
                     dtype=np.int32,
                 )
                 mask_input = None
@@ -124,7 +157,7 @@ class InteractivePredictorAdapter:
                 outputs = self.predictor.predict(
                     point_coords=point_coords,
                     point_labels=point_labels,
-                    box=np.asarray(bbox, dtype=np.float32),
+                    box=local_bbox,
                     mask_input=mask_input,
                     multimask_output=bool(getattr(self.settings, "multi_mask", True)),
                 )
@@ -139,11 +172,15 @@ class InteractivePredictorAdapter:
                     masks=np.asarray(masks),
                     scores=np.asarray(scores),
                     low_res_logits=np.asarray(low_res_logits),
-                    bbox=bbox,
-                    positive_points=positive_points,
-                    negative_points=negative_points,
-                    original_polygon=original_polygon,
-                    image_size=prepared_image.original_size,
+                    bbox=tuple(float(v) for v in local_bbox),
+                    positive_points=tuple((x - left, y - top) for x, y in positive_points),
+                    negative_points=tuple((x - left, y - top) for x, y in negative_points),
+                    original_polygon=tuple((x - left, y - top) for x, y in original_polygon),
+                    image_size=crop_size,
+                    pred_poly=outputs[3] if len(outputs) == 4 else None,
+                    offset=(left, top),
+                    full_size=prepared_image.original_size,
+                    max_distance=int(getattr(self.settings, "max_distance", 10)),
                 )
                 self.predictor.reset_image()
                 return result
@@ -177,6 +214,10 @@ class InteractivePredictorAdapter:
         negative_points: tuple[tuple[float, float], ...],
         original_polygon: tuple[tuple[float, float], ...],
         image_size: tuple[int, int],
+        pred_poly: Any,
+        offset: tuple[int, int],
+        full_size: tuple[int, int],
+        max_distance: int,
     ) -> PredictionResult:
         height, width = image_size
         if masks.ndim != 3 or masks.shape[0] == 0:
@@ -231,9 +272,9 @@ class InteractivePredictorAdapter:
                 rank = (
                     float(positive_hits),
                     float(-negative_hits),
+                    model_score,
                     float(original_iou),
                     float(bbox_overlap),
-                    model_score,
                     float(area),
                 )
                 strategy = (
@@ -255,15 +296,27 @@ class InteractivePredictorAdapter:
                 500,
             )
 
-        polygon, metadata = extract_main_polygon_from_mask(
-            selected_mask,
-            positive_points=[(int(round(x)), int(round(y))) for x, y in positive_points],
-        )
-        if polygon is None or len(polygon) < 3:
+        if not isinstance(pred_poly, dict) or "vmap" not in pred_poly or "voff" not in pred_poly:
             raise InteractiveAPIError(
-                "invalid_model_output", "The selected mask could not form a polygon.", 500
+                "invalid_model_output", "SAMPoly returned no polygon vertex outputs.", 500
             )
-        points = _normalize_output_polygon(polygon, width, height)
+        import torch
+        try:
+            polygon, _ = polygon_from_prediction_mask(
+                mask=selected_mask.reshape(1, height, width),
+                pred_vmap=torch.sigmoid(pred_poly["vmap"]),
+                pred_voff=torch.sigmoid(pred_poly["voff"]),
+                crop_width=width, crop_height=height,
+                pos_transform=(offset[0], offset[1], 1, 1),
+                image_width=full_size[1], image_height=full_size[0],
+                max_distance=max_distance,
+            )
+        except ValueError as exc:
+            raise InteractiveAPIError("invalid_model_output", str(exc), 500) from exc
+        points = _normalize_output_polygon(polygon, full_size[1], full_size[0])
+        if any(not (offset[0] <= x < offset[0] + width and offset[1] <= y < offset[1] + height)
+               for x, y in points):
+            raise InteractiveAPIError("invalid_model_output", "Predicted polygon escaped the target crop.", 500)
         xs = [point[0] for point in points]
         ys = [point[1] for point in points]
         bbox_xywh = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
@@ -289,8 +342,7 @@ class InteractivePredictorAdapter:
             raise InteractiveAPIError(
                 "invalid_model_output", "SAMPoly returned non-finite mask logits.", 500
             )
-        if metadata.get("reason"):
-            strategy = f"{strategy}:{metadata['reason']}"
+        strategy += ":bbox_crop_vertex"
         return PredictionResult(points, bbox_xywh, score, next_logits, strategy)
 
     def close(self) -> None:

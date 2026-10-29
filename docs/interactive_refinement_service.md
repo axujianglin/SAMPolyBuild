@@ -1,6 +1,6 @@
 # SAMPoly 多轮交互优化 HTTP 服务部署与联调手册
 
-本服务实现 SHORTER 交互优化协议 `2.0`，与已有 Auto 服务相互独立。影像仅在创建 session 时上传一次，服务端缓存 image embedding；后续 refine 请求只传 JSON，并可通过 `interaction_token` 继续使用上一轮低分辨率 mask logits。
+本服务实现 SHORTER 交互优化协议 `2.0`，与已有 Auto 服务相互独立。影像仅在创建 session 时上传一次；首次优化某个 BBox 时，服务端按本地交互模式裁剪建筑邻域、计算并缓存该裁剪区域的 image embedding。同一 BBox 的后续 refine 请求只传 JSON 并复用 embedding，可通过 `interaction_token` 继续使用上一轮低分辨率 mask logits。
 
 ## 1. 接口
 
@@ -146,10 +146,9 @@ curl -sS -o /dev/null -w 'HTTP %{http_code}\n' -X DELETE \
 ```bash
 conda activate sampoly
 cd ~/projects/sampoly/SAMPolyBuild
-python -m unittest \
-  tests.test_interactive_session_store \
-  tests.test_interactive_predictor_adapter \
-  tests.test_interactive_api -v
+python -m unittest discover -s tests -p 'test_interactive_session_store.py' -v
+python -m unittest discover -s tests -p 'test_interactive_predictor_adapter.py' -v
+python -m unittest discover -s tests -p 'test_interactive_api.py' -v
 ```
 
 服务启动后，可选执行真实 checkpoint 三轮验证：
@@ -189,7 +188,8 @@ proxy_url=
 
 - TTL 是成功访问后刷新的空闲超时，使用单调时钟计算。
 - session 过期返回 HTTP 410 / `session_expired`；未知或主动删除的 session 返回 HTTP 404 / `session_not_found`。
-- embedding 和 logits 保存在服务端，不编码进 token；session 删除、过期或服务关闭时释放。
+- 创建 session 时缓存上传影像的 RGB 像素；首次 refine 某个 BBox 时按本地交互窗口的 7.5% 边缘裁剪并编码，同一 BBox 的后续轮次复用裁剪 embedding。不同 BBox 使用独立缓存，每个 session 最多保留 16 个裁剪 embedding。embedding 和 logits 不编码进 token；session 删除、过期或服务关闭时释放。
+- Prompt 坐标和模型顶点轮廓在裁剪坐标系内处理，响应 Polygon 再映射到原图像素坐标；超出目标裁剪区域的异常 Polygon 会被拒绝。
 - token 为空时，即使 revision 大于 1，也根据完整累计点从头推理。
 - 只有输出 polygon、bbox、score 和 logits 全部验证成功后，才原子替换交互状态。
 - 默认仅允许一个模型任务进入 GPU；繁忙时返回 HTTP 429 / `service_busy`。
